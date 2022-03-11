@@ -1,0 +1,13 @@
+env:
+  GOPATH: ${GOPATH}
+var:
+  conv: github.com/blitz-frost/conv
+routes:
+  clean:
+    procs:
+    - path: go
+      args: [mod, edit, "-dropreplace={{.conv}}"]
+  taint:
+    procs:
+    - path: go
+      args: [mod, edit, "-replace={{.conv}}=${BLITZ}/conv"]

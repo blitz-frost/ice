@@ -81,6 +81,10 @@ func arrayTo(dst *block, src conv.Array) error {
 }
 
 func arrayishTo(dst *block, src conv.ArrayInterface) error {
+	if src.Len() == 0 {
+		return nil
+	}
+
 	elem := src.Elem()
 	if isSolid(elem) {
 		size := elem.Size() * uintptr(src.Len())
@@ -330,6 +334,9 @@ func sliceFrom(dst *conv.Slice, src block) error {
 
 	if isSolid(elem) {
 		n := int(end-*src.i) / int(elem.Size())
+		if n == 0 {
+			return nil
+		}
 		p := unsafe.Pointer(src.dataPtr())
 		dst.UnsafeSet(p, n)
 		*src.i = end
