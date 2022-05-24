@@ -39,7 +39,7 @@ func init() {
 	inverse.Build(&thaw)
 }
 
-func Marshal(v interface{}) ([]byte, error) {
+func Marshal(v any) ([]byte, error) {
 	b := NewBlock()
 	if err := b.Freeze(v); err != nil {
 		return nil, err
@@ -47,7 +47,7 @@ func Marshal(v interface{}) ([]byte, error) {
 	return b.ToBytes(), nil
 }
 
-func Unmarshal(v interface{}, b []byte) error {
+func Unmarshal(v any, b []byte) error {
 	blk := FromBytes(b)
 	return blk.Thaw(v)
 }
@@ -430,9 +430,9 @@ type Block struct {
 	// Thus the only utility of unsafe.Pointer would be to allow superposition of different pointers on the heap.
 	// This is because pointers of different types will not be equal, even if they share the same address,
 	// but different types are encoded differently; it does not seem worth dealing with, as this would be exceedingly rare in normal Go programs.
-	frozen map[interface{}]uint64 // map already frozen pointers to heap index
-	thawed map[uint64]interface{} // map heap index to already thawed pointers
-	heap   []byte                 // encoded pointer data
+	frozen map[any]uint64 // map already frozen pointers to heap index
+	thawed map[uint64]any // map heap index to already thawed pointers
+	heap   []byte         // encoded pointer data
 }
 
 func FromBytes(b []byte) Block {
@@ -454,17 +454,17 @@ func newBlock(stack, heap []byte) *Block {
 	return &Block{
 		stack:  stack,
 		i:      i,
-		frozen: make(map[interface{}]uint64),
-		thawed: make(map[uint64]interface{}),
+		frozen: make(map[any]uint64),
+		thawed: make(map[uint64]any),
 		heap:   heap,
 	}
 }
 
-func (x *Block) Freeze(v interface{}) error {
+func (x *Block) Freeze(v any) error {
 	return freeze(x, v)
 }
 
-func (x Block) Thaw(v interface{}) error {
+func (x Block) Thaw(v any) error {
 	return thaw(v, x)
 }
 
@@ -512,8 +512,8 @@ func (x *Block) metaReserve() int {
 }
 
 var (
-	freeze func(*Block, interface{}) error
-	thaw   func(interface{}, Block) error
+	freeze func(*Block, any) error
+	thaw   func(any, Block) error
 )
 
 // to ensure a level of portability, meta values are encoded as uint64
