@@ -2,418 +2,110 @@
 // An encoding is called a "block" and can be thought of as a mini heap dump.
 //
 // The goal of ice is to provide a binary format with efficient random access, for use in storage or communication between programs.
+//
+// This package imports all "reflect" identifiers explicitly.
+//
+// Following is a brief description of the binary format
+//
+// The top level form of an ice block is
+//	[stack][heap]
+// Where both stack and heap are of the form
+//	[end][data]
+// [x end] is the end index of x in the raw bytes. This is always a uint64.
+//
+// Values are sequentially encoded onto the stack. Values pointed at by pointers are encoded into the heap.
+// The stack and heap generally follow the same rules. See pointer handling below for more information on the heap's role and usage.
+//
+// A type is said to be solid if all its data is guaranteed to be contained in a single memory block, whose size is knowable just by knowing the type.
+// Boolean and numeric types are solid, as well as all arrays and structs that are recursively composed of these types.
+//
+// Solid types are encoded through direct memory reading. A consequence of this is that this package is not portable between architectures.
+//
+// Arrays are encoded as
+//	[index_0][index_1]...
+//
+// Slices are encoded as
+//	[end][index_0][index_1]...
+//
+// Strings are equivalent to byte slices.
+//
+// Maps are encoded as
+//	[end][key_0][value_0][key_1][value_1]...
+//
+// Structs, including both exported and non-exported fields, are encoded as
+//	[field_0][field_1]...
+//
+// Channels must be bidirectional, and will be drained. They are encoded as
+//	[cap][data end][data_0][data_1]...[closed]
+//
+// Pointers are handled a bit differently. The value that is being pointed at is encoded onto the heap, while its index in the heap functions as the value of the pointer itself.
+// This pointer value might end up itself on the heap, if the pointer is reached by dereferencing another pointer. When encoding or decoding, encountered pointers are remembered and reused if encountered again.
+// This also guards against infinite loops in cyclical data. Unsafe pointers are currently not allowed.
+//
+// Function and interface types are invalid. Mechanisms for dealing with interfaces might be added in the future.
+//
+// Decoded values are generally views of the binary data. Therefore, a byte slice used for decoding should not be used for anything else.
+//
+// Using the "Freeze" and "Thaw" Block methods is equivalent to encoding or decoding strucs, one field at a time. A Block must never be used for both freezing and thawing. This restriction may be lifted in the future.
 package ice
 
 import (
-	"reflect"
+	. "reflect"
 	"unsafe"
 
 	"github.com/blitz-frost/conv"
 )
 
+// to ensure a level of portability, meta values are encoded as uint64
+const (
+	metaSize = 8 // size of a single meta value, in bytes
+)
+
+var (
+	libConv    *conv.Library[converter]
+	schemeConv = conv.Scheme[converter]{}
+
+	libInv    *conv.Library[inverter]
+	schemeInv = conv.Scheme[inverter]{}
+)
+
+var typeBlock = TypeOf(Block{})
+
+type (
+	converter = func(*Block, Value) error
+	inverter  = func(Block) (Value, error)
+)
+
 func init() {
-	scheme := conv.MakeScheme(Block{})
-	scheme.Load(arrayTo)
-	scheme.Load(boolTo)
-	scheme.Load(mapTo)
-	scheme.Load(numberTo)
-	scheme.Load(pointerTo)
-	scheme.Load(reflectTo)
-	scheme.Load(reflectSliceTo)
-	scheme.Load(sliceTo)
-	scheme.Load(stringTo)
-	scheme.Load(structTo)
-	scheme.Build(&freeze)
+	schemeConv.Use(invalidConv)
+	schemeInv.Use(invalidInv)
 
-	inverse := conv.MakeInverse(Block{})
-	inverse.Load(arrayFrom)
-	inverse.Load(boolFrom)
-	inverse.Load(mapFrom)
-	inverse.Load(numberFrom)
-	inverse.Load(pointerFrom)
-	inverse.Load(reflectFrom)
-	inverse.Load(reflectSliceFrom)
-	inverse.Load(sliceFrom)
-	inverse.Load(stringFrom)
-	inverse.Load(structFrom)
-	inverse.Build(&thaw)
-}
+	schemeConv.Use(solidConv)
+	schemeInv.Use(solidInv)
 
-func Marshal(v any) ([]byte, error) {
-	b := NewBlock()
-	if err := b.Freeze(v); err != nil {
-		return nil, err
-	}
-	return b.ToBytes(), nil
-}
+	schemeConv.Use(stringConv)
+	schemeInv.Use(stringInv)
 
-func Unmarshal(v any, b []byte) error {
-	blk := FromBytes(b)
-	return blk.Thaw(v)
-}
+	schemeConv.Use(arrayConv)
+	schemeInv.Use(arrayInv)
 
-func arrayFrom(dst *conv.Array, src Block) error {
-	elem := dst.Elem()
-	if isSolid(elem) {
-		p := unsafe.Pointer(src.dataPtr())
-		dst.UnsafeSet(p, 0)
+	schemeConv.Use(sliceConv)
+	schemeInv.Use(sliceInv)
 
-		size := uint64(elem.Size()) * uint64(dst.Len())
-		*src.i += size
-		return nil
-	}
+	schemeConv.Use(mapConv)
+	schemeInv.Use(mapInv)
 
-	for i, n := 0, dst.Len(); i < n; i++ {
-		p := dst.New()
-		if err := thaw(p, src); err != nil {
-			return err
-		}
-		dst.SetPtr(i, p)
-	}
+	schemeConv.Use(structConv)
+	schemeInv.Use(structInv)
 
-	return nil
-}
+	schemeConv.Use(pointerConv)
+	schemeInv.Use(pointerInv)
 
-func arrayTo(dst *Block, src conv.Array) error {
-	return arrayishTo(dst, src)
-}
+	schemeConv.Use(chanConv)
+	schemeInv.Use(chanInv)
 
-func arrayishTo(dst *Block, src conv.ArrayInterface) error {
-	if src.Len() == 0 {
-		return nil
-	}
-
-	elem := src.Elem()
-	if isSolid(elem) {
-		size := elem.Size() * uintptr(src.Len())
-		dst.stack = memAppend(dst.stack, unsafe.Pointer(src.Unsafe()), size)
-		return nil
-	}
-
-	for i, n := 0, src.Len(); i < n; i++ {
-		if err := freeze(dst, src.Index(i)); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func boolFrom(dst *bool, src Block) error {
-	if src.data()[0] == 0 {
-		*dst = false
-	} else {
-		*dst = true
-	}
-
-	*src.i++
-	return nil
-}
-
-func boolTo(dst *Block, src bool) error {
-	if src {
-		dst.stack = append(dst.stack, 1)
-	} else {
-		dst.stack = append(dst.stack, 0)
-	}
-	return nil
-}
-
-func isSolid(t reflect.Type) bool {
-	k := t.Kind()
-	if conv.IsNumeric(k) || k == reflect.Bool {
-		return true
-	}
-
-	switch k {
-	case reflect.Array:
-		return isSolid(t.Elem())
-	case reflect.Struct:
-		for i, n := 0, t.NumField(); i < n; i++ {
-			if !isSolid(t.Field(i).Type) {
-				return false
-			}
-		}
-		return true
-	}
-
-	return false
-}
-
-func mapFrom(dst *conv.Map, src Block) error {
-	end := src.metaRead()
-
-	for *src.i < end {
-		k := dst.NewKey()
-		v := dst.NewValue()
-		if err := thaw(k, src); err != nil {
-			return err
-		}
-		if err := thaw(v, src); err != nil {
-			return err
-		}
-		dst.SetPtr(k, v)
-	}
-
-	return nil
-}
-
-func mapTo(dst *Block, src conv.Map) error {
-	i := dst.metaReserve() // reserve map end
-
-	// add (key, value) pairs one by one recursively
-	// internal map layout is opaque, so don't attempt optimization
-	r := src.Range()
-	for r.Next() {
-		if err := freeze(dst, r.Key()); err != nil {
-			return err
-		}
-		if err := freeze(dst, r.Value()); err != nil {
-			return err
-		}
-	}
-
-	dst.commit(i)
-	return nil
-}
-
-func memAppend(dst []byte, p unsafe.Pointer, size uintptr) []byte {
-	b := unsafe.Slice((*byte)(p), size)
-	return append(dst, b...)
-}
-
-func memCopy(dst []byte, p unsafe.Pointer, size uintptr) {
-	b := unsafe.Slice((*byte)(p), size)
-	copy(dst, b)
-}
-
-func metaAppend(dst []byte, m uint64) []byte {
-	return memAppend(dst, unsafe.Pointer(&m), metaSize)
-}
-
-func metaCopy(dst []byte, m uint64) {
-	memCopy(dst, unsafe.Pointer(&m), metaSize)
-}
-
-func metaRead(src *byte) uint64 {
-	return *(*uint64)(unsafe.Pointer(src))
-}
-
-func numberFrom(dst *conv.Number, src Block) error {
-	dst.UnsafeSet(unsafe.Pointer(src.dataPtr()))
-	*src.i += uint64(dst.Size())
-	return nil
-}
-
-func numberTo(dst *Block, src conv.Number) error {
-	size := src.Size()
-	dst.stack = memAppend(dst.stack, unsafe.Pointer(src.Unsafe()), size)
-	return nil
-}
-
-func pointerFrom(dst *conv.Pointer, src Block) error {
-	// check if pointer is already known
-	i := src.metaRead()
-	p, ok := src.thawed[i]
-	if ok {
-		// if known, just copy it and return
-		dst.Set(p)
-		return nil
-	}
-
-	// decode the pointer's value from heap
-	p = dst.Value()
-	tmp := Block{
-		stack:  src.heap,
-		heap:   src.heap,
-		thawed: src.thawed,
-		i:      new(uint64),
-		frozen: src.frozen, // not really important
-	}
-	*tmp.i = i // keep original i separate, to add it to the table
-
-	if err := thaw(p, tmp); err != nil {
-		return err
-	}
-
-	// register pointer for future reuse
-	src.thawed[i] = p
-
-	return nil
-}
-
-func pointerTo(dst *Block, src conv.Pointer) error {
-	// check if pointer is already known
-	p := src.Value()
-	i, ok := dst.frozen[p]
-	if ok {
-		// if known, just write its value and return
-		dst.stack = metaAppend(dst.stack, i)
-		return nil
-	}
-
-	// register pointer, adding its value to the heap
-
-	// are we in a "heap block"?
-	//
-	// in a heap block, dst.heap is only used to check the block type
-	// otherwise all operations are on "stack", which is actually some other block's heap
-	//
-	// pointer conversions are currently the only ones that need to be aware of this distinction
-	//
-	// the stack and heap should always be distinct in a normal block; if they start at the same address, we can conclude that we are in a heap block (see recursion below)
-	// this is why the heap must always contain at least one byte
-	var heap *[]byte // will point to the "stack" in a heap block
-	i = uint64(len(dst.heap))
-	if &dst.stack[0] == &dst.heap[0] {
-		// if we're in a heap block, we add a pointer pointing after itself, where its value will be added
-		// the normal approach would result in a pointer pointing to itself
-
-		heap = &dst.stack
-		i += metaSize
-	} else {
-		// if we're in a normal block, we add a pointer to the stack, pointing at the end of the heap, where the pointer's value will be added
-
-		heap = &dst.heap
-	}
-
-	dst.frozen[p] = i
-	dst.stack = metaAppend(dst.stack, i)
-
-	// we want to freeze pointer values into the heap
-	// use a "heap block" to use normal code
-	// this will update the table automatically; we also recover its "stack"
-	tmp := Block{
-		stack:  *heap,
-		heap:   *heap,
-		frozen: dst.frozen,
-		thawed: dst.thawed, // not really important
-		i:      dst.i,      // not really important
-	}
-
-	if err := freeze(&tmp, src.Elem()); err != nil {
-		return err
-	}
-
-	*heap = tmp.stack
-	return nil
-}
-
-func reflectFrom(dst *reflect.Value, src Block) error {
-	return thaw(dst.Interface(), src)
-}
-
-func reflectTo(dst *Block, src reflect.Value) error {
-	return freeze(dst, src.Interface())
-}
-
-func reflectSliceFrom(dst *[]reflect.Value, src Block) error {
-	for i := 0; i < len(*dst); i++ {
-		if err := thaw((*dst)[i].Interface(), src); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func reflectSliceTo(dst *Block, src []reflect.Value) error {
-	for i := 0; i < len(src); i++ {
-		if err := freeze(dst, src[i].Interface()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func sliceFrom(dst *conv.Slice, src Block) error {
-	elem := dst.Elem()
-
-	end := src.metaRead()
-
-	if isSolid(elem) {
-		n := int(end-*src.i) / int(elem.Size())
-		if n == 0 {
-			return nil
-		}
-		p := unsafe.Pointer(src.dataPtr())
-		dst.UnsafeSet(p, n)
-		*src.i = end
-		return nil
-	}
-
-	for *src.i < end {
-		p := dst.New()
-		if err := thaw(p, src); err != nil {
-			return err
-		}
-		dst.AppendPtr(p)
-	}
-
-	return nil
-}
-
-func sliceTo(dst *Block, src conv.Slice) error {
-	i := dst.metaReserve() // save current index
-	defer func() {
-		dst.commit(i)
-	}()
-	return arrayishTo(dst, src)
-}
-
-func stringFrom(dst *string, src Block) error {
-	end := src.metaRead()
-	*dst = string(src.dataSlice(end))
-	*src.i = end
-	return nil
-}
-
-func stringTo(dst *Block, src string) error {
-	end := uint64(len(dst.stack)+len(src)) + metaSize
-	dst.stack = metaAppend(dst.stack, end)
-	dst.stack = append(dst.stack, src...)
-	return nil
-}
-
-func structFrom(dst *conv.Struct, src Block) error {
-	if t := dst.Type(); isSolid(t) {
-		p := unsafe.Pointer(src.dataPtr())
-		dst.UnsafeSet(p)
-		size := uint64(t.Size())
-		*src.i += size
-		return nil
-	}
-
-	iter := dst.RangeEx()
-	for iter.Next() {
-		p := iter.New()
-		if err := thaw(p, src); err != nil {
-			return err
-		}
-		iter.SetPtr(p)
-	}
-
-	return nil
-}
-
-func structTo(dst *Block, src conv.Struct) error {
-	// note: since the goal of this package is ultimately to facilitate communication between programs, we opt for complete struct encoding/decoding, including unexported fields
-
-	// a solid struct can be directly memory copied
-	if t := src.Type(); isSolid(t) {
-		p := unsafe.Pointer(src.Unsafe())
-		dst.stack = memAppend(dst.stack, p, t.Size())
-		return nil
-	}
-
-	// a fluid struct needs to be frozen field by field
-	iter := src.RangeEx()
-	for iter.Next() {
-		if err := freeze(dst, iter.Value()); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	libConv = conv.NewLibrary[converter](schemeConv.Build, nil)
+	libInv = conv.NewLibrary[inverter](schemeInv.Build, nil)
 }
 
 // A Block is a container for encoded data.
@@ -461,11 +153,29 @@ func newBlock(stack, heap []byte) *Block {
 }
 
 func (x *Block) Freeze(v any) error {
-	return freeze(x, v)
+	f := libConv.Get(TypeOf(v))
+	return f(x, ValueOf(v))
 }
 
-func (x Block) Thaw(v any) error {
-	return thaw(v, x)
+func (x *Block) FreezeValue(v Value) error {
+	f := libConv.Get(v.Type())
+	return f(x, v)
+}
+
+func Thaw[T any](x Block) (T, error) {
+	t := conv.TypeEval[T]()
+	f := libInv.Get(t)
+	v, err := f(x)
+	if err != nil {
+		var o T
+		return o, err
+	}
+	return v.Interface().(T), nil
+}
+
+func (x Block) ThawValue(t Type) (Value, error) {
+	f := libInv.Get(t)
+	return f(x)
 }
 
 func (x Block) ToBytes() []byte {
@@ -479,11 +189,6 @@ func (x Block) ToBytes() []byte {
 // Used to fill in previously reserved meta bytes, registering the end of the last encoded stack value.
 func (x Block) commit(i int) {
 	metaCopy(x.stack[i:], uint64(len(x.stack)))
-}
-
-// data returns a slice of the stack starting at the current working index.
-func (x Block) data() []byte {
-	return x.stack[*x.i:]
 }
 
 // dataPtr returns a pointer to the current working index in the stack.
@@ -511,12 +216,571 @@ func (x *Block) metaReserve() int {
 	return i
 }
 
-var (
-	freeze func(*Block, any) error
-	thaw   func(any, Block) error
-)
+func Marshal(v any) ([]byte, error) {
+	return MarshalValue(ValueOf(v))
+}
 
-// to ensure a level of portability, meta values are encoded as uint64
-const (
-	metaSize = 8 // size of a single meta value, in bytes
-)
+func MarshalValue(v Value) ([]byte, error) {
+	x := NewBlock()
+	err := x.FreezeValue(v)
+	if err != nil {
+		return nil, err
+	}
+	return x.ToBytes(), nil
+}
+
+func Unmarshal[T any](b []byte) (T, error) {
+	x := FromBytes(b)
+	return Thaw[T](x)
+}
+
+func UnmarshalValue(t Type, b []byte) (Value, error) {
+	x := FromBytes(b)
+	return x.ThawValue(t)
+}
+
+func arrayConv(t Type) (converter, bool) {
+	if t.Kind() != Array {
+		return nil, false
+	}
+
+	return arrayishConv(t), true
+}
+
+func arrayInv(t Type) (inverter, bool) {
+	if t.Kind() != Array {
+		return nil, false
+	}
+
+	f, _ := schemeInv.Build(t.Elem())
+	return func(x Block) (Value, error) {
+		o := New(t).Elem()
+		for i, n := 0, o.Len(); i < n; i++ {
+			elem, _ := f(x)
+			o.Index(i).Set(elem)
+		}
+		return o, nil
+	}, true
+}
+
+// Used by arrayConv and sliceConv. Not directly part of the conversion library. Doesn't make any type checks.
+func arrayishConv(t Type) converter {
+	f, _ := schemeConv.Build(t.Elem())
+	return func(x *Block, v Value) error {
+		n := v.Len()
+		if n == 0 {
+			return nil
+		}
+
+		for i := 0; i < n; i++ {
+			f(x, v.Index(i))
+		}
+
+		return nil
+	}
+}
+
+func chanConv(t Type) (converter, bool) {
+	if t.Kind() != Chan {
+		return nil, false
+	}
+
+	f, _ := schemeConv.Build(t.Elem())
+	return func(x *Block, v Value) error {
+		x.stack = metaAppend(x.stack, uint64(v.Cap()))
+
+		i := x.metaReserve()
+		for {
+			elem, ok := v.TryRecv()
+			if !ok {
+				x.commit(i)
+
+				closed := byte(0)
+				if elem.IsValid() {
+					closed = 1
+				}
+				x.stack = append(x.stack, closed)
+				break
+			}
+			f(x, elem)
+		}
+		return nil
+	}, true
+}
+
+func chanInv(t Type) (inverter, bool) {
+	if t.Kind() != Chan {
+		return nil, false
+	}
+
+	f, _ := schemeInv.Build(t.Elem())
+	return func(x Block) (Value, error) {
+		n := int(x.metaRead())
+		o := MakeChan(t, n)
+
+		end := x.metaRead()
+		for *x.i < end {
+			v, _ := f(x)
+			o.Send(v)
+		}
+
+		if x.stack[*x.i] == 1 {
+			o.Close()
+		}
+		*x.i++
+		return o, nil
+	}, true
+}
+
+func invalidConv(t Type) (converter, bool) {
+	if !conv.Check(t, isValid) {
+		return func(x *Block, v Value) error {
+			return conv.ErrInvalid
+		}, true
+	}
+	return nil, false
+}
+
+func invalidInv(t Type) (inverter, bool) {
+	if !conv.Check(t, isValid) {
+		return func(x Block) (Value, error) {
+			return Value{}, conv.ErrInvalid
+		}, true
+	}
+	return nil, false
+}
+
+// A solid type doesn't contain any pointers, and is stored in a single memory block.
+func isSolid(t Type) bool {
+	switch t.Kind() {
+	case Chan, Map, Pointer, Slice, String: // Func and Interface should never pass the validity test
+		return false
+	}
+	return true
+}
+
+// isValid returns false if the type is a function, interface or unsafe.Pointer type.
+func isValid(t Type) bool {
+	switch t.Kind() {
+	case Chan:
+		if t.ChanDir() != BothDir {
+			return false
+		}
+	case Func, Interface, UnsafePointer:
+		return false
+	}
+	return true
+}
+
+func mapConv(t Type) (converter, bool) {
+	if t.Kind() != Map {
+		return nil, false
+	}
+
+	fk, _ := schemeConv.Build(t.Key())
+	fv, _ := schemeConv.Build(t.Elem())
+	return func(x *Block, v Value) error {
+		i := x.metaReserve()
+
+		iter := v.MapRange()
+		for iter.Next() {
+			fk(x, iter.Key())
+			fv(x, iter.Value())
+		}
+
+		x.commit(i)
+		return nil
+	}, true
+}
+
+func mapInv(t Type) (inverter, bool) {
+	if t.Kind() != Map {
+		return nil, false
+	}
+
+	fk, _ := schemeInv.Build(t.Key())
+	fv, _ := schemeInv.Build(t.Elem())
+	return func(x Block) (Value, error) {
+		end := x.metaRead()
+		o := MakeMap(t)
+
+		for *x.i < end {
+			k, _ := fk(x)
+			v, _ := fv(x)
+			o.SetMapIndex(k, v)
+		}
+
+		return o, nil
+	}, true
+}
+
+func memAppend(dst []byte, p unsafe.Pointer, size uintptr) []byte {
+	b := unsafe.Slice((*byte)(p), size)
+	return append(dst, b...)
+}
+
+func memCopy(dst []byte, p unsafe.Pointer, size uintptr) {
+	b := unsafe.Slice((*byte)(p), size)
+	copy(dst, b)
+}
+
+func metaAppend(dst []byte, m uint64) []byte {
+	return memAppend(dst, unsafe.Pointer(&m), metaSize)
+}
+
+func metaCopy(dst []byte, m uint64) {
+	memCopy(dst, unsafe.Pointer(&m), metaSize)
+}
+
+func metaRead(src *byte) uint64 {
+	return *(*uint64)(unsafe.Pointer(src))
+}
+
+func pointerConv(t Type) (converter, bool) {
+	if t.Kind() != Pointer {
+		return nil, false
+	}
+
+	f, _ := schemeConv.Build(t.Elem())
+	return func(x *Block, v Value) error {
+		// check if pointer is already known
+		p := v.Interface()
+		i, ok := x.frozen[p]
+		if ok {
+			// if known, just write its value and return
+			x.stack = metaAppend(x.stack, i)
+			return nil
+		}
+
+		// register pointer, adding its value to the heap
+
+		// are we in a "heap block"?
+		//
+		// in a heap block, the "heap" memeber is only used to check the block type
+		// otherwise all operations are on "stack", which is actually some other block's heap
+		//
+		// pointer conversions are currently the only ones that need to be aware of this distinction
+		//
+		// the stack and heap should always be distinct in a normal block; if they start at the same address, we can conclude that we are in a heap block (see recursion below)
+		// this is why the heap must always contain at least one byte
+		var heap *[]byte // will point to the "stack" in a heap block
+		i = uint64(len(x.heap))
+		if &x.stack[0] == &x.heap[0] {
+			// if we're in a heap block, we add a pointer pointing after itself, where its value will be added
+			// the normal approach would result in a pointer pointing to itself
+
+			heap = &x.stack
+			i += metaSize
+		} else {
+			// if we're in a normal block, we add a pointer to the stack, pointing at the end of the heap, where the pointer's value will be added
+
+			heap = &x.heap
+		}
+
+		x.frozen[p] = i
+		x.stack = metaAppend(x.stack, i)
+
+		// we want to freeze pointer values into the heap
+		// use a "heap block" to use normal code
+		// this will update the table automatically; we also recover its "stack"
+		tmp := Block{
+			stack:  *heap,
+			heap:   *heap,
+			frozen: x.frozen,
+			thawed: x.thawed, // not really important
+			i:      x.i,      // not really important
+		}
+
+		f(&tmp, v.Elem())
+
+		*heap = tmp.stack
+		return nil
+	}, true
+}
+
+func pointerInv(t Type) (inverter, bool) {
+	if t.Kind() != Pointer {
+		return nil, false
+	}
+
+	elem := t.Elem()
+	f, _ := schemeInv.Build(elem)
+	return func(x Block) (Value, error) {
+		// check if pointer is already known
+		i := x.metaRead()
+		p, ok := x.thawed[i]
+		if ok {
+			// if known, just return it
+			return ValueOf(p), nil
+		}
+
+		// decode the pointer's value from heap
+		tmp := Block{
+			stack:  x.heap,
+			heap:   x.heap,
+			thawed: x.thawed,
+			i:      new(uint64),
+			frozen: x.frozen, // not really important
+		}
+		*tmp.i = i // keep original i separate, to add it to the table
+
+		ov, _ := f(tmp)
+		o := New(elem)
+		o.Elem().Set(ov)
+		return o, nil
+	}, true
+}
+
+func sliceConv(t Type) (converter, bool) {
+	if t.Kind() != Slice {
+		return nil, false
+	}
+
+	if elem := t.Elem(); conv.Check(elem, isSolid) {
+		return func(x *Block, v Value) error {
+			i := x.metaReserve()
+			n := uintptr(v.Len())
+			if n == 0 {
+				x.commit(i)
+				return nil
+			}
+			size := elem.Size() * n
+			x.stack = memAppend(x.stack, v.UnsafePointer(), size)
+			x.commit(i)
+			return nil
+		}, true
+	}
+
+	f := arrayishConv(t)
+	return func(x *Block, v Value) error {
+		i := x.metaReserve()
+		f(x, v)
+		x.commit(i)
+		return nil
+	}, true
+}
+
+func sliceInv(t Type) (inverter, bool) {
+	if t.Kind() != Slice {
+		return nil, false
+	}
+
+	elem := t.Elem()
+	if conv.Check(elem, isSolid) {
+		return func(x Block) (Value, error) {
+			end := x.metaRead()
+			n := int(end-*x.i) / int(elem.Size())
+			if n == 0 {
+				return MakeSlice(t, 0, 0), nil
+			}
+			p := unsafe.Pointer(x.dataPtr())
+			*x.i = end
+
+			arrayType := ArrayOf(n, elem)
+			array := NewAt(arrayType, p).Elem()
+			slice := array.Slice(0, n)
+			return slice.Convert(t), nil // t might be a named slice type
+		}, true
+	}
+
+	f, _ := schemeInv.Build(elem)
+	return func(x Block) (Value, error) {
+		end := x.metaRead()
+		o := MakeSlice(t, 0, 0)
+		for *x.i < end {
+			v, _ := f(x)
+			o = Append(o, v)
+		}
+		return o, nil
+	}, true
+}
+
+func solidConv(t Type) (converter, bool) {
+	if !conv.Check(t, isSolid) {
+		return nil, false
+	}
+
+	return func(x *Block, v Value) error {
+		var ptr Value
+		if v.CanAddr() {
+			ptr = v.Addr()
+		} else {
+			ptr = New(t)
+			ptr.Elem().Set(v)
+		}
+		x.stack = memAppend(x.stack, ptr.UnsafePointer(), t.Size())
+		return nil
+	}, true
+}
+
+func solidInv(t Type) (inverter, bool) {
+	if !conv.Check(t, isSolid) {
+		return nil, false
+	}
+
+	return func(x Block) (Value, error) {
+		ptr := unsafe.Pointer((x.dataPtr()))
+		o := NewAt(t, ptr)
+		*x.i += uint64(t.Size())
+		return o.Elem(), nil
+	}, true
+}
+
+func stringConv(t Type) (converter, bool) {
+	if t.Kind() != String {
+		return nil, false
+	}
+
+	return func(x *Block, v Value) error {
+		n := v.Len()
+		end := uint64(len(x.stack)+n) + metaSize
+		x.stack = metaAppend(x.stack, end)
+
+		if v.CanAddr() {
+			// get pointer to slice start, without copying
+			h := (*StringHeader)(v.Addr().UnsafePointer())
+			p := unsafe.Pointer(h.Data)
+			x.stack = memAppend(x.stack, p, uintptr(n))
+			return nil
+		}
+
+		s := v.String()
+		x.stack = append(x.stack, s...)
+		return nil
+	}, true
+}
+
+func stringInv(t Type) (inverter, bool) {
+	if t.Kind() != String {
+		return nil, false
+	}
+
+	return func(x Block) (Value, error) {
+		end := x.metaRead()
+		b := x.dataSlice(end)
+		*x.i = end
+
+		p := unsafe.Pointer(&b)
+		return NewAt(t, p).Elem(), nil
+	}, true
+}
+
+func structConv(t Type) (converter, bool) {
+	if t.Kind() != Struct {
+		return nil, false
+	}
+
+	type fieldConv struct {
+		fn         converter
+		t          Type
+		isExported bool
+		offset     uintptr
+	}
+
+	n := t.NumField()
+	haveUnexported := false
+	f := make([]fieldConv, n)
+	for i := range f {
+		field := t.Field(i)
+		isExported := field.IsExported()
+		haveUnexported = haveUnexported || !isExported
+		ff, _ := schemeConv.Build(field.Type)
+		f[i] = fieldConv{
+			fn:         ff,
+			t:          field.Type,
+			isExported: isExported,
+			offset:     field.Offset,
+		}
+	}
+
+	if !haveUnexported {
+		return func(x *Block, v Value) error {
+			for i := range f {
+				f[i].fn(x, v.Field(i))
+			}
+			return nil
+		}, true
+	}
+
+	return func(x *Block, v Value) error {
+		// need pointer to access unexported fields
+		var p unsafe.Pointer
+		if v.CanAddr() {
+			p = v.Addr().UnsafePointer()
+		} else {
+			tmp := New(t)
+			tmp.Elem().Set(v)
+			p = tmp.UnsafePointer()
+		}
+
+		for i, field := range f {
+			if field.isExported {
+				field.fn(x, v.Field(i))
+				continue
+			}
+
+			pf := unsafe.Add(p, field.offset)
+			vf := NewAt(field.t, pf).Elem()
+			field.fn(x, vf)
+		}
+		return nil
+	}, true
+}
+
+func structInv(t Type) (inverter, bool) {
+	if t.Kind() != Struct {
+		return nil, false
+	}
+
+	type fieldInv struct {
+		fn         inverter
+		t          Type
+		isExported bool
+		offset     uintptr
+	}
+
+	n := t.NumField()
+	haveUnexported := false
+	f := make([]fieldInv, n)
+	for i := range f {
+		field := t.Field(i)
+		isExported := field.IsExported()
+		haveUnexported = haveUnexported || !isExported
+		ff, _ := schemeInv.Build(field.Type)
+		f[i] = fieldInv{
+			fn:         ff,
+			t:          field.Type,
+			isExported: isExported,
+			offset:     field.Offset,
+		}
+	}
+
+	if !haveUnexported {
+		return func(x Block) (Value, error) {
+			o := New(t).Elem()
+			for i := range f {
+				vf, _ := f[i].fn(x)
+				o.Field(i).Set(vf)
+			}
+			return o, nil
+		}, true
+	}
+
+	return func(x Block) (Value, error) {
+		oPtr := New(t)
+		p := oPtr.UnsafePointer()
+		o := oPtr.Elem()
+		for i, field := range f {
+			vf, _ := field.fn(x)
+			if field.isExported {
+				o.Field(i).Set(vf)
+				continue
+			}
+
+			pf := unsafe.Add(p, field.offset)
+			of := NewAt(field.t, pf).Elem()
+			of.Set(vf)
+		}
+		return o, nil
+	}, true
+}
