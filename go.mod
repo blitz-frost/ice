@@ -1,7 +1,9 @@
 module github.com/blitz-frost/ice
 
-go 1.18
+go 1.20
 
-require github.com/blitz-frost/conv v0.3.0
-
-replace github.com/blitz-frost/conv => /home/blitzfrost/go/src/github.com/blitz-frost/conv
+require (
+	github.com/blitz-frost/conv v0.3.1
+	github.com/blitz-frost/encoding v0.1.1
+	github.com/blitz-frost/io v0.2.4
+)

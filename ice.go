@@ -1,16 +1,21 @@
 // Package ice defines an encoding of Go values that tries to mirror the Go memory model itself.
 // An encoding is called a "block" and can be thought of as a mini heap dump.
 //
-// The goal of ice is to provide a binary format with efficient random access, for use in storage or communication between programs.
+// The goal of ice is to provide a fast and convenient low level format, for use in storage or communication across process boundries of a centralized Go project.
+// It DOES NOT strive to be space efficient or some sort of safe, universal formal.
 //
 // This package imports all "reflect" identifiers explicitly.
 //
-// Following is a brief description of the binary format
+// # Following is a brief description of the binary format
 //
 // The top level form of an ice block is
+//
 //	[stack][heap]
+//
 // Where both stack and heap are of the form
+//
 //	[end][data]
+//
 // [x end] is the end index of x in the raw bytes. This is always a uint64.
 //
 // Values are sequentially encoded onto the stack. Values pointed at by pointers are encoded into the heap.
@@ -19,41 +24,58 @@
 // A type is said to be solid if all its data is guaranteed to be contained in a single memory block, whose size is knowable just by knowing the type.
 // Boolean and numeric types are solid, as well as all arrays and structs that are recursively composed of these types.
 //
-// Solid types are encoded through direct memory reading. A consequence of this is that this package is not portable between architectures.
+// Solid types are encoded through direct memory reading. A consequence of this is that this package is not portable between architectures. This might change if it proves problematic, or a compatibility layer can't reasonably be implemented.
 //
 // Arrays are encoded as
+//
 //	[index_0][index_1]...
 //
 // Slices are encoded as
+//
 //	[end][index_0][index_1]...
 //
 // Strings are equivalent to byte slices.
 //
 // Maps are encoded as
+//
 //	[end][key_0][value_0][key_1][value_1]...
 //
 // Structs, including both exported and non-exported fields, are encoded as
+//
 //	[field_0][field_1]...
 //
 // Channels must be bidirectional, and will be drained. They are encoded as
+//
 //	[cap][data end][data_0][data_1]...[closed]
 //
 // Pointers are handled a bit differently. The value that is being pointed at is encoded onto the heap, while its index in the heap functions as the value of the pointer itself.
 // This pointer value might end up itself on the heap, if the pointer is reached by dereferencing another pointer. When encoding or decoding, encountered pointers are remembered and reused if encountered again.
-// This also guards against infinite loops in cyclical data. Unsafe pointers are currently not allowed.
+// This also guards against infinite loops in cyclical data.
 //
-// Function and interface types are invalid. Mechanisms for dealing with interfaces might be added in the future.
+// Interfaces have two possible encodings, the general form being
 //
-// Decoded values are generally views of the binary data. Therefore, a byte slice used for decoding should not be used for anything else.
+//	[type id][type description][type specific encoding]
 //
-// Using the "Freeze" and "Thaw" Block methods is equivalent to encoding or decoding strucs, one field at a time. A Block must never be used for both freezing and thawing. This restriction may be lifted in the future.
+// where "type" is the concrete type of the value being handled. When a Codec has been created with a type-id mapping, Blocks created with that Codec will inherit it.
+// When encountering a mapped type under an interface value, the type id is inserted before the actual encoding and the description is skipped.
+// When encountering a type that is not mapped, an id of 0 is used, followed by a type description. A decoding Block will then be capable of yielding the unnamed base type that matches that description.
+// No interface implementation checks are made.
+//
+// Function types and unsafe.Pointers are invalid.
+//
+// Decoded values are often views of the binary data. Therefore, a byte slice used for decoding should not be used for anything else.
+//
+// A Block may hold any number of sequentially encoded values, and must never be used for both encoding and decoding. This restriction may be lifted in the future.
 package ice
 
 import (
+	"errors"
 	. "reflect"
 	"unsafe"
 
 	"github.com/blitz-frost/conv"
+	"github.com/blitz-frost/encoding"
+	"github.com/blitz-frost/io"
 )
 
 // to ensure a level of portability, meta values are encoded as uint64
@@ -73,7 +95,7 @@ var typeBlock = TypeOf(Block{})
 
 type (
 	converter = func(*Block, Value) error
-	inverter  = func(Block) (Value, error)
+	inverter  = func(*Block) (Value, error)
 )
 
 func init() {
@@ -104,16 +126,21 @@ func init() {
 	schemeConv.Use(chanConv)
 	schemeInv.Use(chanInv)
 
+	schemeConv.Use(interfaceConv)
+	schemeInv.Use(interfaceInv)
+
 	libConv = conv.NewLibrary[converter](schemeConv.Build, nil)
 	libInv = conv.NewLibrary[inverter](schemeInv.Build, nil)
 }
 
 // A Block is a container for encoded data.
-// Values can be added or retrieved from the Block through the "Freeze" and "Thaw" methods.
+// Values can be added or retrieved from the Block through the Freeze/Encode and Thaw/Decode methods.
 // A Block can be used either for freezing or thawing, but not both.
+//
+// Block values must be obtain via a valid Codec.
 type Block struct {
-	stack []byte  // encoded data
-	i     *uint64 // working index in stack
+	stack []byte // encoded data
+	i     uint64 // working index in stack
 
 	// unsafe.Pointer could also be used for the pointer maps,
 	// but the only reliable check we can make with the current Go runtime is direct pointer comparison.
@@ -125,44 +152,54 @@ type Block struct {
 	frozen map[any]uint64 // map already frozen pointers to heap index
 	thawed map[uint64]any // map heap index to already thawed pointers
 	heap   []byte         // encoded pointer data
+
+	// Registered mappings for interface handling.
+	// If a type is registered, interface values that hold it will be preceeded by the corresponding ID.
+	// This allows decoding into concrete types.
+	// If a type is not registered, decoding can only yield unnamed types.
+	registry    map[Type]byte
+	registryInv map[byte]Type
 }
 
-func FromBytes(b []byte) Block {
-	i := metaRead(&b[0])
-	return *newBlock(b[:i], b[i:])
-}
-
-func NewBlock() *Block {
-	// stack and heap start with their own lengths; initially unknown so just allocate the space
-	stack := make([]byte, metaSize)
-	heap := make([]byte, metaSize)
-	return newBlock(stack, heap)
-}
-
-func newBlock(stack, heap []byte) *Block {
-	i := new(uint64)
-	*i = metaSize
-
+// reg and regInv may not be nil
+func blockNew(stack, heap []byte, reg map[Type]byte, regInv map[byte]Type) *Block {
 	return &Block{
-		stack:  stack,
-		i:      i,
-		frozen: make(map[any]uint64),
-		thawed: make(map[uint64]any),
-		heap:   heap,
+		stack:       stack,
+		i:           metaSize, // stack starts with the end index; it's set at the end
+		frozen:      make(map[any]uint64),
+		thawed:      make(map[uint64]any),
+		heap:        heap,
+		registry:    reg,
+		registryInv: regInv,
 	}
 }
 
+// Bytes returns the accumulated raw encoding.
+func (x *Block) Bytes() []byte {
+	x.commit(0)                               // commit stack size
+	metaCopy(x.heap[0:], uint64(len(x.heap))) // commit heap size
+
+	return append(x.stack, x.heap...)
+}
+
+func (x *Block) Decode(t Type) (Value, error) {
+	f := libInv.Get(t)
+	return f(x)
+}
+
+func (x *Block) Encode(v Value) error {
+	f := libConv.Get(v.Type())
+	return f(x, v)
+}
+
+// Freeze is a convenience method for encoding an arbitraty value into the Block.
 func (x *Block) Freeze(v any) error {
 	f := libConv.Get(TypeOf(v))
 	return f(x, ValueOf(v))
 }
 
-func (x *Block) FreezeValue(v Value) error {
-	f := libConv.Get(v.Type())
-	return f(x, v)
-}
-
-func Thaw[T any](x Block) (T, error) {
+// Thaw is the decoding counterpart to Block.Freeze, but currently methods can't have type parameters.
+func Thaw[T any](x *Block) (T, error) {
 	t := conv.TypeEval[T]()
 	f := libInv.Get(t)
 	v, err := f(x)
@@ -173,38 +210,26 @@ func Thaw[T any](x Block) (T, error) {
 	return v.Interface().(T), nil
 }
 
-func (x Block) ThawValue(t Type) (Value, error) {
-	f := libInv.Get(t)
-	return f(x)
-}
-
-func (x Block) ToBytes() []byte {
-	x.commit(0)                               // commit stack size
-	metaCopy(x.heap[0:], uint64(len(x.heap))) // commit heap size
-
-	return append(x.stack, x.heap...)
-}
-
 // commit writes the current stack size to the given stack index.
 // Used to fill in previously reserved meta bytes, registering the end of the last encoded stack value.
-func (x Block) commit(i int) {
+func (x *Block) commit(i int) {
 	metaCopy(x.stack[i:], uint64(len(x.stack)))
 }
 
 // dataPtr returns a pointer to the current working index in the stack.
-func (x Block) dataPtr() *byte {
-	return &x.stack[*x.i]
+func (x *Block) dataPtr() *byte {
+	return &x.stack[x.i]
 }
 
 // dataSlice returns a slice up to the specified index of the current working stack.
-func (x Block) dataSlice(end uint64) []byte {
-	return x.stack[*x.i:end]
+func (x *Block) dataSlice(end uint64) []byte {
+	return x.stack[x.i:end]
 }
 
 // metaRead returns the meta value at the current index, then advances the index past it.
-func (x Block) metaRead() uint64 {
+func (x *Block) metaRead() uint64 {
 	p := x.dataPtr()
-	*x.i += metaSize
+	x.i += metaSize
 	return metaRead(p)
 }
 
@@ -216,27 +241,155 @@ func (x *Block) metaReserve() int {
 	return i
 }
 
-func Marshal(v any) ([]byte, error) {
-	return MarshalValue(ValueOf(v))
+// A Codec is used to create Block values, which will inherit its concrete type mapping when dealing with interfaces.
+// By using different Codecs, a program may define independent contracts with multiple other programs.
+//
+// It implements encoding.Codec, to facilitate usage as part of a larger communication framework.
+//
+// A Codec is concurrent safe, but a Block is not.
+type Codec struct {
+	registry    map[Type]byte
+	registryInv map[byte]Type
 }
 
-func MarshalValue(v Value) ([]byte, error) {
-	x := NewBlock()
-	err := x.FreezeValue(v)
-	if err != nil {
+// CodecMake creates a Codec that will use the provided type mapping when dealing with interface values. Unnamed types are valid, making them slightly more efficient as it skips generic type recognition.
+//
+// Due to an id being the length of a byte, and the 0 value being reserved, only up to 255 unique types may be provided. This should be more than enough for any reasonable use case.
+func CodecMake(m map[Type]byte) (Codec, error) {
+	if m == nil {
+		m = make(map[Type]byte) // prevent later panics
+	}
+
+	// generate inverse mapping
+	mInv := make(map[byte]Type)
+	for t, v := range m {
+		if v == 0 {
+			return Codec{}, errors.New("a type may not map to 0")
+		}
+		if _, ok := mInv[v]; ok {
+			return Codec{}, errors.New("mapping is not unique")
+		}
+		mInv[v] = t
+	}
+
+	return Codec{
+		registry:    m,
+		registryInv: mInv,
+	}, nil
+}
+
+// Block returns a valid empty Block.
+func (x Codec) Block() *Block {
+	// stack and heap start with their own lengths; initially unknown so just allocate the space
+	stack := make([]byte, metaSize)
+	heap := make([]byte, metaSize)
+	return blockNew(stack, heap, x.registry, x.registryInv)
+}
+
+// BlockOf initializes a Block value on top of what is assumed to be a valid raw binary encoding.
+func (x Codec) BlockOf(b []byte) *Block {
+	i := metaRead(&b[0])
+	return blockNew(b[:i], b[i:], x.registry, x.registryInv)
+}
+
+// Decoder reads an entire Block from r and then wraps it as an encoding.Decoder.
+func (x Codec) Decoder(r io.Reader) (encoding.Decoder, error) {
+	size := make([]byte, metaSize)
+
+	// read stack size
+	if _, err := r.Read(size); err != nil {
 		return nil, err
 	}
-	return x.ToBytes(), nil
+
+	// allocate and read stack
+	stack := make([]byte, metaRead(&size[0]))
+	copy(stack, size)
+	if _, err := r.Read(stack[metaSize:]); err != nil {
+		return nil, err
+	}
+
+	// read heap size
+	if _, err := r.Read(size); err != nil {
+		return nil, err
+	}
+
+	// allocate and read heap
+	heap := make([]byte, metaRead(&size[0]))
+	copy(heap, size)
+	if _, err := r.Read(heap[metaSize:]); err != nil {
+		return nil, err
+	}
+
+	return decoder{
+		r: r,
+		b: blockNew(stack, heap, x.registry, x.registryInv),
+	}, nil
 }
 
-func Unmarshal[T any](b []byte) (T, error) {
-	x := FromBytes(b)
-	return Thaw[T](x)
+// Encoder returns an encoding.Encoder that wraps a new Block. It writes out its data when closing.
+func (x Codec) Encoder(w io.Writer) (encoding.Encoder, error) {
+	return encoder{
+		w: w,
+		b: x.Block(),
+	}, nil
 }
 
-func UnmarshalValue(t Type, b []byte) (Value, error) {
-	x := FromBytes(b)
-	return x.ThawValue(t)
+type decoder struct {
+	r io.Reader
+	b *Block
+}
+
+func (x decoder) Close() error {
+	// could probably close the reader on initialization and do nothing here
+	return x.r.Close()
+}
+
+func (x decoder) Decode(t Type) (Value, error) {
+	return x.b.Decode(t)
+}
+
+type encoder struct {
+	w io.Writer
+	b *Block
+}
+
+func (x encoder) Close() error {
+	b := x.b.Bytes()
+	errs := make([]error, 0, 2)
+	if _, err := x.w.Write(b); err != nil {
+		errs = append(errs, err)
+	}
+	if err := x.w.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func (x encoder) Encode(v Value) error {
+	return x.b.Encode(v)
+}
+
+// GenerateMapping takes a list of values, and returns an id mapping for the encountered.
+// The mapping is guaranteed to be always be the same for the same input value types.
+func GenerateMapping(v ...any) (map[Type]byte, error) {
+	o := make(map[Type]byte)
+	i := byte(1) // 0 is reserved for unknown
+	for _, val := range v {
+		t := TypeOf(val)
+		if _, ok := o[t]; ok {
+			// skip duplicate types
+			continue
+		}
+
+		o[t] = i
+		i++
+		if i == 0 {
+			// reached overflow
+			return nil, errors.New("too many types")
+		}
+	}
+
+	return o, nil
 }
 
 func arrayConv(t Type) (converter, bool) {
@@ -253,7 +406,7 @@ func arrayInv(t Type) (inverter, bool) {
 	}
 
 	f, _ := schemeInv.Build(t.Elem())
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		o := New(t).Elem()
 		for i, n := 0, o.Len(); i < n; i++ {
 			elem, _ := f(x)
@@ -314,20 +467,20 @@ func chanInv(t Type) (inverter, bool) {
 	}
 
 	f, _ := schemeInv.Build(t.Elem())
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		n := int(x.metaRead())
 		o := MakeChan(t, n)
 
 		end := x.metaRead()
-		for *x.i < end {
+		for x.i < end {
 			v, _ := f(x)
 			o.Send(v)
 		}
 
-		if x.stack[*x.i] == 1 {
+		if x.stack[x.i] == 1 {
 			o.Close()
 		}
-		*x.i++
+		x.i++
 		return o, nil
 	}, true
 }
@@ -343,30 +496,86 @@ func invalidConv(t Type) (converter, bool) {
 
 func invalidInv(t Type) (inverter, bool) {
 	if !conv.Check(t, isValid) {
-		return func(x Block) (Value, error) {
+		return func(x *Block) (Value, error) {
 			return Value{}, conv.ErrInvalid
 		}, true
 	}
 	return nil, false
 }
 
-// A solid type doesn't contain any pointers, and is stored in a single memory block.
+func interfaceConv(t Type) (converter, bool) {
+	if t.Kind() != Interface {
+		return nil, false
+	}
+
+	return func(x *Block, v Value) error {
+		v = v.Elem() // v will initially be an interface type, but we actually want the element it contains
+		vType := v.Type()
+
+		// encode type information
+		id := x.registry[vType]
+		x.Freeze(id)
+
+		if id == 0 {
+			// add full description for unregistered types
+			b := baseOf(vType)
+			x.Freeze(b)
+		}
+
+		// encode actual value
+		return x.Encode(v)
+	}, true
+}
+
+func interfaceInv(t Type) (inverter, bool) {
+	if t.Kind() != Interface {
+		return nil, false
+	}
+
+	return func(x *Block) (Value, error) {
+		id, _ := Thaw[byte](x)
+
+		var vType Type
+		if id != 0 {
+			// use registered type
+			var ok bool
+			if vType, ok = x.registryInv[id]; !ok {
+				return Value{}, errors.New("unregistered type")
+			}
+		} else {
+			// obtain type from encoded base
+			base, err := Thaw[base](x)
+			if err != nil {
+				return Value{}, err
+			}
+
+			vType, err = typeOf(base)
+			if err != nil {
+				return Value{}, err
+			}
+		}
+
+		return x.Decode(vType)
+	}, true
+}
+
+// A solid type doesn't involve pointers, and is stored in a single memory block whole size is knowable in advance.
 func isSolid(t Type) bool {
 	switch t.Kind() {
-	case Chan, Map, Pointer, Slice, String: // Func and Interface should never pass the validity test
+	case Chan, Func, Interface, Map, Pointer, Slice, String:
 		return false
 	}
 	return true
 }
 
-// isValid returns false if the type is a function, interface or unsafe.Pointer type.
+// isValid returns false if the type is a function, unsafe.Pointer, or non-bidirectional channel.
 func isValid(t Type) bool {
 	switch t.Kind() {
 	case Chan:
 		if t.ChanDir() != BothDir {
 			return false
 		}
-	case Func, Interface, UnsafePointer:
+	case Func, UnsafePointer:
 		return false
 	}
 	return true
@@ -400,11 +609,11 @@ func mapInv(t Type) (inverter, bool) {
 
 	fk, _ := schemeInv.Build(t.Key())
 	fv, _ := schemeInv.Build(t.Elem())
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		end := x.metaRead()
 		o := MakeMap(t)
 
-		for *x.i < end {
+		for x.i < end {
 			k, _ := fk(x)
 			v, _ := fv(x)
 			o.SetMapIndex(k, v)
@@ -505,7 +714,7 @@ func pointerInv(t Type) (inverter, bool) {
 
 	elem := t.Elem()
 	f, _ := schemeInv.Build(elem)
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		// check if pointer is already known
 		i := x.metaRead()
 		p, ok := x.thawed[i]
@@ -519,12 +728,11 @@ func pointerInv(t Type) (inverter, bool) {
 			stack:  x.heap,
 			heap:   x.heap,
 			thawed: x.thawed,
-			i:      new(uint64),
+			i:      i,
 			frozen: x.frozen, // not really important
 		}
-		*tmp.i = i // keep original i separate, to add it to the table
 
-		ov, _ := f(tmp)
+		ov, _ := f(&tmp)
 		o := New(elem)
 		o.Elem().Set(ov)
 		return o, nil
@@ -567,14 +775,14 @@ func sliceInv(t Type) (inverter, bool) {
 
 	elem := t.Elem()
 	if conv.Check(elem, isSolid) {
-		return func(x Block) (Value, error) {
+		return func(x *Block) (Value, error) {
 			end := x.metaRead()
-			n := int(end-*x.i) / int(elem.Size())
+			n := int(end-x.i) / int(elem.Size())
 			if n == 0 {
 				return MakeSlice(t, 0, 0), nil
 			}
 			p := unsafe.Pointer(x.dataPtr())
-			*x.i = end
+			x.i = end
 
 			arrayType := ArrayOf(n, elem)
 			array := NewAt(arrayType, p).Elem()
@@ -584,10 +792,10 @@ func sliceInv(t Type) (inverter, bool) {
 	}
 
 	f, _ := schemeInv.Build(elem)
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		end := x.metaRead()
 		o := MakeSlice(t, 0, 0)
-		for *x.i < end {
+		for x.i < end {
 			v, _ := f(x)
 			o = Append(o, v)
 		}
@@ -618,10 +826,10 @@ func solidInv(t Type) (inverter, bool) {
 		return nil, false
 	}
 
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		ptr := unsafe.Pointer((x.dataPtr()))
 		o := NewAt(t, ptr)
-		*x.i += uint64(t.Size())
+		x.i += uint64(t.Size())
 		return o.Elem(), nil
 	}, true
 }
@@ -655,10 +863,10 @@ func stringInv(t Type) (inverter, bool) {
 		return nil, false
 	}
 
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		end := x.metaRead()
 		b := x.dataSlice(end)
-		*x.i = end
+		x.i = end
 
 		p := unsafe.Pointer(&b)
 		return NewAt(t, p).Elem(), nil
@@ -756,7 +964,7 @@ func structInv(t Type) (inverter, bool) {
 	}
 
 	if !haveUnexported {
-		return func(x Block) (Value, error) {
+		return func(x *Block) (Value, error) {
 			o := New(t).Elem()
 			for i := range f {
 				vf, _ := f[i].fn(x)
@@ -766,7 +974,7 @@ func structInv(t Type) (inverter, bool) {
 		}, true
 	}
 
-	return func(x Block) (Value, error) {
+	return func(x *Block) (Value, error) {
 		oPtr := New(t)
 		p := oPtr.UnsafePointer()
 		o := oPtr.Elem()

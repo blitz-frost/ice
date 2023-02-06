@@ -1,4 +1,3 @@
 TODO
-- read and write functions to allow Block transfer with fewer allocations
-- interface handling?
 - partial Block transfer mechanism (fetching only a specific part of a remote Block)
+- alignment considerations

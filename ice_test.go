@@ -2,19 +2,46 @@ package ice
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 )
 
-func TestArray(t *testing.T) {
-	b, err := Marshal([4]int{1, 2, 3, 4})
-	fmt.Println("[4]int ->", b, err)
-	a, err := Unmarshal[[4]int](b)
-	fmt.Println("[4]int <-", a, err)
+type T struct {
+	a int
+	b any
+}
 
-	b, err = Marshal([2][]int{[]int{1, 2}, []int{3, 4}})
-	fmt.Println("[2][]int ->", b, err)
-	a2, err := Unmarshal[[2][]int](b)
-	fmt.Println("[2][]int <-", a2, err)
+var m, _ = GenerateMapping(T{})
+var c, _ = CodecMake(m)
+
+// perform an encode + decode loop
+// returns the decoded value, in case the default printed messages aren't adequate, particularly for pointers and channels
+func test(v any) any {
+	block := c.Block()
+	t := reflect.TypeOf(v)
+
+	err := block.Freeze(v)
+	if err != nil {
+		fmt.Println(t, "freeze error:", err)
+		return nil
+	}
+	b := block.Bytes()
+	fmt.Println(t, "->", b)
+
+	block = c.BlockOf(b)
+	oVal, err := block.Decode(t)
+	if err != nil {
+		fmt.Println(t, "thaw error:", err)
+		return nil
+	}
+	o := oVal.Interface()
+	fmt.Println(t, "<-", oVal.Interface())
+	return o
+}
+
+func TestArray(t *testing.T) {
+	test([4]int{1, 2, 3, 4})
+	test([2][]int{[]int{1, 2}, []int{3, 4}})
 }
 
 func TestChan(t *testing.T) {
@@ -22,24 +49,21 @@ func TestChan(t *testing.T) {
 	a <- 43
 	a <- 44
 
-	b, err := Marshal(a)
-	fmt.Println("chan int 3 ->", b, err)
-	a, err = Unmarshal[chan int](b)
-	fmt.Println("chan int 3 <-", <-a, <-a, err)
-}
-
-func TestMap(t *testing.T) {
-	b, err := Marshal(map[int]int{1: 2, 3: 4})
-	fmt.Println("map[int]int ->", b, err)
-	a, err := Unmarshal[map[int]int](b)
-	fmt.Println("map[int]int <-", a, err)
+	b := test(a).(chan int)
+	fmt.Println(<-b, <-b)
 }
 
 func TestInt(t *testing.T) {
-	b, err := Marshal(44)
-	fmt.Println("int ->", b, err)
-	a, err := Unmarshal[int](b)
-	fmt.Println("int <-", a, err)
+	test(44)
+}
+
+func TestInterface(t *testing.T) {
+	b := test(T{1, T{2, 3}}).(T)
+	fmt.Println(reflect.TypeOf(b.b))
+}
+
+func TestMap(t *testing.T) {
+	test(map[int]int{1: 2, 3: 4})
 }
 
 func TestPointer(t *testing.T) {
@@ -48,34 +72,19 @@ func TestPointer(t *testing.T) {
 	a2 := new(int)
 	*a2 = 46
 
-	b, err := Marshal(a)
-	fmt.Println("*int ->", b, err)
-	a, err = Unmarshal[*int](b)
-	fmt.Println("*int <-", *a, err)
-
-	b, err = Marshal([]*int{a, a, a2})
-	fmt.Println("[]*int ->", b, err)
-	a3, err := Unmarshal[[]*int](b)
-	fmt.Println("[]*int <-", *a3[0], *a3[1], *a3[2], err)
+	b := test(a).(*int)
+	fmt.Println(*b)
+	c := test([]*int{a, a, a2}).([]*int)
+	fmt.Println(*c[0], *c[1], *c[2])
 }
 
 func TestSlice(t *testing.T) {
-	b, err := Marshal([]int{2, 3, 4})
-	fmt.Println("[]int ->", b, err)
-	a, err := Unmarshal[[]int](b)
-	fmt.Println("[]int <-", a, err)
-
-	b, err = Marshal([]string{"one", "two"})
-	fmt.Println("[]string ->", b, err)
-	a2, err := Unmarshal[[]string](b)
-	fmt.Println("[]string <-", a2, err)
+	test([]int{2, 3, 4})
+	test([]string{"one", "two"})
 }
 
 func TestString(t *testing.T) {
-	b, err := Marshal("asdf")
-	fmt.Println("string ->", b, err)
-	a, err := Unmarshal[string](b)
-	fmt.Println("string <-", a, err)
+	test("asdf")
 }
 
 func TestStruct(t *testing.T) {
@@ -84,8 +93,5 @@ func TestStruct(t *testing.T) {
 		B []int
 	}
 
-	b, err := Marshal(aStruct{1, []int{2, 3}})
-	fmt.Println("struct{int, []int} ->", b, err)
-	a, err := Unmarshal[aStruct](b)
-	fmt.Println("struct{int, []int} <-", a, err)
+	test(aStruct{1, []int{2, 3}})
 }
