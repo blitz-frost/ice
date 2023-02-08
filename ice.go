@@ -52,13 +52,12 @@
 // This pointer value might end up itself on the heap, if the pointer is reached by dereferencing another pointer. When encoding or decoding, encountered pointers are remembered and reused if encountered again.
 // This also guards against infinite loops in cyclical data.
 //
-// Interfaces have two possible encodings, the general form being
+// Interfaces are encoded as
 //
-//	[type id][type description][type specific encoding]
+//	[type description][type specific encoding]
 //
 // where "type" is the concrete type of the value being handled. When a Codec has been created with a type-id mapping, Blocks created with that Codec will inherit it.
-// When encountering a mapped type under an interface value, the type id is inserted before the actual encoding and the description is skipped.
-// When encountering a type that is not mapped, an id of 0 is used, followed by a type description. A decoding Block will then be capable of yielding the unnamed base type that matches that description.
+// When encountering a mapped type under an interface value, a type id is used to represent it. Otherwise a type representation is used, allowing a decoder to recreate the equivalent unnamed type.
 // No interface implementation checks are made.
 //
 // Function types and unsafe.Pointers are invalid.
@@ -154,23 +153,17 @@ type Block struct {
 	heap   []byte         // encoded pointer data
 
 	// Registered mappings for interface handling.
-	// If a type is registered, interface values that hold it will be preceeded by the corresponding ID.
-	// This allows decoding into concrete types.
-	// If a type is not registered, decoding can only yield unnamed types.
-	registry    map[Type]byte
-	registryInv map[byte]Type
+	m *mapping
 }
 
-// reg and regInv may not be nil
-func blockNew(stack, heap []byte, reg map[Type]byte, regInv map[byte]Type) *Block {
+func blockNew(stack, heap []byte, m *mapping) *Block {
 	return &Block{
-		stack:       stack,
-		i:           metaSize, // stack starts with the end index; it's set at the end
-		frozen:      make(map[any]uint64),
-		thawed:      make(map[uint64]any),
-		heap:        heap,
-		registry:    reg,
-		registryInv: regInv,
+		stack:  stack,
+		i:      metaSize, // stack starts with the end index; it's set at the end
+		frozen: make(map[any]uint64),
+		thawed: make(map[uint64]any),
+		heap:   heap,
+		m:      m,
 	}
 }
 
@@ -248,34 +241,18 @@ func (x *Block) metaReserve() int {
 //
 // A Codec is concurrent safe, but a Block is not.
 type Codec struct {
-	registry    map[Type]byte
-	registryInv map[byte]Type
+	m *mapping
 }
 
 // CodecMake creates a Codec that will use the provided type mapping when dealing with interface values. Unnamed types are valid, making them slightly more efficient as it skips generic type recognition.
 //
-// Due to an id being the length of a byte, and the 0 value being reserved, only up to 255 unique types may be provided. This should be more than enough for any reasonable use case.
+// Id values 0-26 are reserved. Thus, only up to 229 unique types may be provided. This should be more than enough for any reasonable use case.
 func CodecMake(m map[Type]byte) (Codec, error) {
-	if m == nil {
-		m = make(map[Type]byte) // prevent later panics
+	mp, err := mappingNew(m)
+	if err != nil {
+		return Codec{}, err
 	}
-
-	// generate inverse mapping
-	mInv := make(map[byte]Type)
-	for t, v := range m {
-		if v == 0 {
-			return Codec{}, errors.New("a type may not map to 0")
-		}
-		if _, ok := mInv[v]; ok {
-			return Codec{}, errors.New("mapping is not unique")
-		}
-		mInv[v] = t
-	}
-
-	return Codec{
-		registry:    m,
-		registryInv: mInv,
-	}, nil
+	return Codec{mp}, nil
 }
 
 // Block returns a valid empty Block.
@@ -283,13 +260,13 @@ func (x Codec) Block() *Block {
 	// stack and heap start with their own lengths; initially unknown so just allocate the space
 	stack := make([]byte, metaSize)
 	heap := make([]byte, metaSize)
-	return blockNew(stack, heap, x.registry, x.registryInv)
+	return blockNew(stack, heap, x.m)
 }
 
 // BlockOf initializes a Block value on top of what is assumed to be a valid raw binary encoding.
 func (x Codec) BlockOf(b []byte) *Block {
 	i := metaRead(&b[0])
-	return blockNew(b[:i], b[i:], x.registry, x.registryInv)
+	return blockNew(b[:i], b[i:], x.m)
 }
 
 // Decoder reads an entire Block from r and then wraps it as an encoding.Decoder.
@@ -322,7 +299,7 @@ func (x Codec) Decoder(r io.Reader) (encoding.Decoder, error) {
 
 	return decoder{
 		r: r,
-		b: blockNew(stack, heap, x.registry, x.registryInv),
+		b: blockNew(stack, heap, x.m),
 	}, nil
 }
 
@@ -367,29 +344,6 @@ func (x encoder) Close() error {
 
 func (x encoder) Encode(v Value) error {
 	return x.b.Encode(v)
-}
-
-// GenerateMapping takes a list of values, and returns an id mapping for the encountered.
-// The mapping is guaranteed to be always be the same for the same input value types.
-func GenerateMapping(v ...any) (map[Type]byte, error) {
-	o := make(map[Type]byte)
-	i := byte(1) // 0 is reserved for unknown
-	for _, val := range v {
-		t := TypeOf(val)
-		if _, ok := o[t]; ok {
-			// skip duplicate types
-			continue
-		}
-
-		o[t] = i
-		i++
-		if i == 0 {
-			// reached overflow
-			return nil, errors.New("too many types")
-		}
-	}
-
-	return o, nil
 }
 
 func arrayConv(t Type) (converter, bool) {
@@ -513,14 +467,8 @@ func interfaceConv(t Type) (converter, bool) {
 		vType := v.Type()
 
 		// encode type information
-		id := x.registry[vType]
-		x.Freeze(id)
-
-		if id == 0 {
-			// add full description for unregistered types
-			b := baseOf(vType)
-			x.Freeze(b)
-		}
+		b := x.m.baseOf(vType)
+		x.Freeze(b)
 
 		// encode actual value
 		return x.Encode(v)
@@ -533,26 +481,11 @@ func interfaceInv(t Type) (inverter, bool) {
 	}
 
 	return func(x *Block) (Value, error) {
-		id, _ := Thaw[byte](x)
+		b, _ := Thaw[base](x)
 
-		var vType Type
-		if id != 0 {
-			// use registered type
-			var ok bool
-			if vType, ok = x.registryInv[id]; !ok {
-				return Value{}, errors.New("unregistered type")
-			}
-		} else {
-			// obtain type from encoded base
-			base, err := Thaw[base](x)
-			if err != nil {
-				return Value{}, err
-			}
-
-			vType, err = typeOf(base)
-			if err != nil {
-				return Value{}, err
-			}
+		vType, err := x.m.typeOf(b)
+		if err != nil {
+			return Value{}, err
 		}
 
 		return x.Decode(vType)

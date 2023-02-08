@@ -8,14 +8,7 @@ import (
 	"sync"
 )
 
-var (
-	baseMap = make(map[Type]base) // known bases mapped by the types they represent
-	baseMux sync.RWMutex
-
-	typeMap = make(map[string]Type) // known types mapped by their base; uses strings since they are comparable, unlike byte slices
-	typeMux sync.RWMutex
-)
-
+// simple in the sense that knowing the kind is enough to identify the base type
 var simpleTypes = map[Kind]Type{
 	Bool:       TypeOf(false),
 	Int:        TypeOf(0),
@@ -44,82 +37,121 @@ var errBaseIncomplete = errors.New("incomplete base")
 // base describes a type's structure. Two types with the same base type will map to the same base.
 type base []byte
 
-func baseOf(t Type) base {
-	baseMux.RLock()
-	x, ok := baseMap[t]
+type mapping struct {
+	baseMap map[Type]base // known bases mapped by the types they represent
+	baseMux sync.RWMutex
+
+	typeMap map[string]Type // known types mapped by their base; uses strings since they are comparable, unlike byte slices
+	typeMux sync.RWMutex
+}
+
+func mappingNew(m map[Type]byte) (*mapping, error) {
+	// copy simple unnamed types
+	baseMap := make(map[Type]base)
+	typeMap := make(map[string]Type)
+	for k, t := range simpleTypes {
+		b := base{byte(k)}
+		baseMap[t] = b
+		typeMap[string(b)] = t
+	}
+
+	// add custom mapping
+	for t, v := range m {
+		if v <= byte(UnsafePointer) {
+			return nil, errors.New("a type may not map to a reserved ID")
+		}
+
+		b := base{v}
+		if _, ok := typeMap[string(b)]; ok {
+			return nil, errors.New("mapping is not unique")
+		}
+
+		baseMap[t] = b
+		typeMap[string(b)] = t
+	}
+
+	return &mapping{
+		baseMap: baseMap,
+		typeMap: typeMap,
+	}, nil
+}
+
+func (x *mapping) baseOf(t Type) base {
+	x.baseMux.RLock()
+	o, ok := x.baseMap[t]
 	if ok {
 		// return already known base
-		baseMux.RUnlock()
-		return x
+		x.baseMux.RUnlock()
+		return o
 	}
-	baseMux.RUnlock()
+	x.baseMux.RUnlock()
 
 	k := t.Kind()
-	x = base{byte(k)}
+	o = base{byte(k)}
 	switch k {
 	case Array:
 		// length + element base
-		x = metaAppend(x, uint64(t.Len()))
+		o = metaAppend(o, uint64(t.Len()))
 		fallthrough
 	case Pointer, Slice:
 		// element base
-		x = append(x, baseOf(t.Elem())...)
+		o = append(o, x.baseOf(t.Elem())...)
 	case Chan:
 		// direction + element base
-		x = append(x, byte(t.ChanDir()))
-		x = append(x, baseOf(t.Elem())...)
+		o = append(o, byte(t.ChanDir()))
+		o = append(o, x.baseOf(t.Elem())...)
 	case Func:
 		if t.IsVariadic() {
-			x = append(x, 0)
+			o = append(o, 0)
 		} else {
-			x = append(x, 1)
+			o = append(o, 1)
 		}
 
 		// input number + input bases, output number + output bases
 		n := t.NumIn()
-		x = metaAppend(x, uint64(n))
+		o = metaAppend(o, uint64(n))
 		for i := 0; i < n; i++ {
-			x = append(x, baseOf(t.In(i))...)
+			o = append(o, x.baseOf(t.In(i))...)
 		}
 
 		n = t.NumOut()
-		x = metaAppend(x, uint64(n))
+		o = metaAppend(o, uint64(n))
 		for i := 0; i < n; i++ {
-			x = append(x, baseOf(t.Out(i))...)
+			o = append(o, x.baseOf(t.Out(i))...)
 		}
 	case Map:
 		// key base + element base
-		x = append(x, baseOf(t.Key())...)
-		x = append(x, baseOf(t.Elem())...)
+		o = append(o, x.baseOf(t.Key())...)
+		o = append(o, x.baseOf(t.Elem())...)
 	case Struct:
 		// field number + field bases
 		n := t.NumField()
-		x = metaAppend(x, uint64(n))
+		o = metaAppend(o, uint64(n))
 		for i := 0; i < n; i++ {
-			x = append(x, baseOf(t.Field(i).Type)...)
+			o = append(o, x.baseOf(t.Field(i).Type)...)
 		}
 	}
 
 	// add to known before returning
-	baseMux.Lock()
-	baseMap[t] = x
-	baseMux.Unlock()
+	x.baseMux.Lock()
+	x.baseMap[t] = o
+	x.baseMux.Unlock()
 
-	return x
+	return o
 }
 
 // typeOf returns the Type corresponding to a base
-func typeOf(b base) (Type, error) {
-	typeMux.RLock()
-	o, ok := typeMap[string(b)]
+func (x *mapping) typeOf(b base) (Type, error) {
+	x.typeMux.RLock()
+	o, ok := x.typeMap[string(b)]
 	if ok {
 		// return already known type
-		typeMux.RUnlock()
+		x.typeMux.RUnlock()
 		return o, nil
 	}
-	typeMux.RUnlock()
+	x.typeMux.RUnlock()
 
-	o, n, err := typeOfEX(b)
+	o, n, err := x.typeOfEX(b)
 	if err != nil {
 		return nil, err
 	}
@@ -131,24 +163,27 @@ func typeOf(b base) (Type, error) {
 
 	// save resulting type for later
 	// there's somewhat of a risk that multiple goroutines will save the same base if they look for it at the same time, but no biggie
-	typeMux.Lock()
-	typeMap[string(b)] = o
-	typeMux.Unlock()
+	x.typeMux.Lock()
+	x.typeMap[string(b)] = o
+	x.typeMux.Unlock()
 
 	return o, nil
 }
 
 // typeOfEX does the actual work of interpreting a base, also returning the number of bytes used
-// does not check or save into the map since subelement types might receive a base that contains more than themselves
-func typeOfEX(b base) (Type, int, error) {
+// only makes rudimentary checks, and does not save into the map, since subelement types might receive a base that contains more than themselves
+func (x *mapping) typeOfEX(b base) (Type, int, error) {
 	if len(b) == 0 {
 		return nil, 0, errors.New("empty base")
 	}
 
-	k := Kind(b[0])
-	if t, ok := simpleTypes[k]; ok {
+	x.typeMux.RLock()
+	// simple and registered map as a single byte
+	if t, ok := x.typeMap[string(b[0:1])]; ok {
+		x.typeMux.RUnlock()
 		return t, 1, nil
 	}
+	x.typeMux.RUnlock()
 
 	var (
 		o Type
@@ -160,7 +195,7 @@ func typeOfEX(b base) (Type, int, error) {
 		if len(b) < n {
 			return nil, 0, errBaseIncomplete
 		}
-		elem, m, err := typeOfEX(b[n:])
+		elem, m, err := x.typeOfEX(b[n:])
 		if err != nil {
 			return nil, 0, fmt.Errorf("array element: %w", err)
 		}
@@ -172,7 +207,7 @@ func typeOfEX(b base) (Type, int, error) {
 		if len(b) < n {
 			return nil, 0, errBaseIncomplete
 		}
-		elem, m, err := typeOfEX(b[n:])
+		elem, m, err := x.typeOfEX(b[n:])
 		if err != nil {
 			return nil, 0, fmt.Errorf("chan element: %w", err)
 		}
@@ -193,7 +228,7 @@ func typeOfEX(b base) (Type, int, error) {
 		num := metaRead(&b[2])
 		in := make([]Type, num)
 		for i := range in {
-			t, m, err := typeOfEX(b[n:])
+			t, m, err := x.typeOfEX(b[n:])
 			if err != nil {
 				return nil, 0, fmt.Errorf("func input %v: %w", i, err)
 			}
@@ -210,7 +245,7 @@ func typeOfEX(b base) (Type, int, error) {
 		n += metaSize
 		out := make([]Type, num)
 		for i := range out {
-			t, m, err := typeOfEX(b[n:])
+			t, m, err := x.typeOfEX(b[n:])
 			if err != nil {
 				return nil, 0, fmt.Errorf("func output %v: %w", i, err)
 			}
@@ -221,13 +256,13 @@ func typeOfEX(b base) (Type, int, error) {
 		o = FuncOf(in, out, isVar)
 	case Map:
 		n = 1
-		key, m, err := typeOfEX(b[n:])
+		key, m, err := x.typeOfEX(b[n:])
 		if err != nil {
 			return nil, 0, fmt.Errorf("map key: %w", err)
 		}
 		n += m
 
-		elem, m, err := typeOfEX(b[n:])
+		elem, m, err := x.typeOfEX(b[n:])
 		if err != nil {
 			return nil, 0, fmt.Errorf("map element: %w", err)
 		}
@@ -236,7 +271,7 @@ func typeOfEX(b base) (Type, int, error) {
 		o = MapOf(key, elem)
 	case Pointer:
 		n = 1
-		elem, m, err := typeOfEX(b[n:])
+		elem, m, err := x.typeOfEX(b[n:])
 		if err != nil {
 			return nil, 0, fmt.Errorf("pointer element: %w", err)
 		}
@@ -244,7 +279,7 @@ func typeOfEX(b base) (Type, int, error) {
 		o = PointerTo(elem)
 	case Slice:
 		n = 1
-		elem, m, err := typeOfEX(b[n:])
+		elem, m, err := x.typeOfEX(b[n:])
 		if err != nil {
 			return nil, 0, fmt.Errorf("slice element: %w", err)
 		}
@@ -259,7 +294,7 @@ func typeOfEX(b base) (Type, int, error) {
 		num := metaRead(&b[1])
 		fields := make([]StructField, num)
 		for i := range fields {
-			t, m, err := typeOfEX(b[n:])
+			t, m, err := x.typeOfEX(b[n:])
 			if err != nil {
 				return nil, 0, fmt.Errorf("struct field %v: %w", i, err)
 			}
@@ -274,4 +309,27 @@ func typeOfEX(b base) (Type, int, error) {
 	}
 
 	return o, n, nil
+}
+
+// GenerateMapping takes a list of values, and returns an id mapping for the encountered.
+// The mapping is guaranteed to be always be the same for the same input value types.
+func GenerateMapping(v ...any) (map[Type]byte, error) {
+	o := make(map[Type]byte)
+	i := byte(UnsafePointer + 1) // skip reserved ids
+	for _, val := range v {
+		if i == 0 {
+			// reached overflow
+			return nil, errors.New("too many types")
+		}
+		t := TypeOf(val)
+		if _, ok := o[t]; ok {
+			// skip duplicate types
+			continue
+		}
+
+		o[t] = i
+		i++
+	}
+
+	return o, nil
 }
