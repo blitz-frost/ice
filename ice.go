@@ -463,6 +463,12 @@ func interfaceConv(t Type) (converter, bool) {
 	}
 
 	return func(x *Block, v Value) error {
+		if v.IsNil() {
+			// encode nil values as an empty base
+			x.Freeze(base{})
+			return nil
+		}
+
 		v = v.Elem() // v will initially be an interface type, but we actually want the element it contains
 		vType := v.Type()
 
@@ -485,6 +491,9 @@ func interfaceInv(t Type) (inverter, bool) {
 
 		vType, err := x.m.typeOf(b)
 		if err != nil {
+			if err == errBaseEmpty {
+				return Zero(t), nil
+			}
 			return Value{}, err
 		}
 
@@ -585,6 +594,12 @@ func pointerConv(t Type) (converter, bool) {
 
 	f, _ := schemeConv.Build(t.Elem())
 	return func(x *Block, v Value) error {
+		// check nil pointer
+		if v.IsNil() {
+			x.stack = metaAppend(x.stack, 0)
+			return nil
+		}
+
 		// check if pointer is already known
 		p := v.Interface()
 		i, ok := x.frozen[p]
@@ -648,8 +663,13 @@ func pointerInv(t Type) (inverter, bool) {
 	elem := t.Elem()
 	f, _ := schemeInv.Build(elem)
 	return func(x *Block) (Value, error) {
-		// check if pointer is already known
+		// check if pointer is nil
 		i := x.metaRead()
+		if i == 0 {
+			return Zero(t), nil
+		}
+
+		// check if pointer is already known
 		p, ok := x.thawed[i]
 		if ok {
 			// if known, just return it

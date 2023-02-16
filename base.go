@@ -32,7 +32,10 @@ var simpleTypes = map[Kind]Type{
 
 var baseType = TypeOf(base{})
 
-var errBaseIncomplete = errors.New("incomplete base")
+var (
+	errBaseEmpty      = errors.New("empty base")
+	errBaseIncomplete = errors.New("incomplete base")
+)
 
 // base describes a type's structure. Two types with the same base type will map to the same base.
 type base []byte
@@ -174,7 +177,7 @@ func (x *mapping) typeOf(b base) (Type, error) {
 // only makes rudimentary checks, and does not save into the map, since subelement types might receive a base that contains more than themselves
 func (x *mapping) typeOfEX(b base) (Type, int, error) {
 	if len(b) == 0 {
-		return nil, 0, errors.New("empty base")
+		return nil, 0, errBaseEmpty
 	}
 
 	x.typeMux.RLock()
