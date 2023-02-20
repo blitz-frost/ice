@@ -646,6 +646,7 @@ func pointerConv(t Type) (converter, bool) {
 			frozen: x.frozen,
 			thawed: x.thawed, // not really important
 			i:      x.i,      // not really important
+			m:      x.m,
 		}
 
 		f(&tmp, v.Elem())
@@ -683,6 +684,7 @@ func pointerInv(t Type) (inverter, bool) {
 			thawed: x.thawed,
 			i:      i,
 			frozen: x.frozen, // not really important
+			m:      x.m,
 		}
 
 		ov, _ := f(&tmp)
