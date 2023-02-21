@@ -152,6 +152,8 @@ type Block struct {
 	thawed map[uint64]any // map heap index to already thawed pointers
 	heap   []byte         // encoded pointer data
 
+	isHeap bool // is this a heap block? (see pointer conversion)
+
 	// Registered mappings for interface handling.
 	m *mapping
 }
@@ -613,25 +615,21 @@ func pointerConv(t Type) (converter, bool) {
 
 		// are we in a "heap block"?
 		//
-		// in a heap block, the "heap" memeber is only used to check the block type
-		// otherwise all operations are on "stack", which is actually some other block's heap
+		// in a heap block all operations are on "stack", which is actually some other block's heap
 		//
 		// pointer conversions are currently the only ones that need to be aware of this distinction
-		//
-		// the stack and heap should always be distinct in a normal block; if they start at the same address, we can conclude that we are in a heap block (see recursion below)
-		// this is why the heap must always contain at least one byte
-		var heap *[]byte // will point to the "stack" in a heap block
-		i = uint64(len(x.heap))
-		if &x.stack[0] == &x.heap[0] {
+		var heap *[]byte
+		if x.isHeap {
+			heap = &x.stack
+
 			// if we're in a heap block, we add a pointer pointing after itself, where its value will be added
 			// the normal approach would result in a pointer pointing to itself
-
-			heap = &x.stack
-			i += metaSize
+			i = uint64(len(x.stack)) + metaSize
 		} else {
-			// if we're in a normal block, we add a pointer to the stack, pointing at the end of the heap, where the pointer's value will be added
-
 			heap = &x.heap
+
+			// if we're in a normal block, we add a pointer to the stack, pointing at the end of the heap, where the pointer's value will be added
+			i = uint64(len(x.heap))
 		}
 
 		x.frozen[p] = i
@@ -642,10 +640,8 @@ func pointerConv(t Type) (converter, bool) {
 		// this will update the table automatically; we also recover its "stack"
 		tmp := Block{
 			stack:  *heap,
-			heap:   *heap,
 			frozen: x.frozen,
-			thawed: x.thawed, // not really important
-			i:      x.i,      // not really important
+			isHeap: true,
 			m:      x.m,
 		}
 
@@ -683,11 +679,16 @@ func pointerInv(t Type) (inverter, bool) {
 			heap:   x.heap,
 			thawed: x.thawed,
 			i:      i,
-			frozen: x.frozen, // not really important
+			isHeap: true,
 			m:      x.m,
 		}
 
 		ov, _ := f(&tmp)
+		if x.isHeap {
+			// jump the value being pointed at in a heap block, in case we need to continue reading sequential values from it
+			x.i = tmp.i
+		}
+
 		o := New(elem)
 		o.Elem().Set(ov)
 		return o, nil
@@ -824,7 +825,7 @@ func stringInv(t Type) (inverter, bool) {
 		x.i = end
 
 		p := unsafe.Pointer(&b)
-		return NewAt(t, p).Elem(), nil
+		return NewAt(t, p).Elem(), nil // a string header starts the same as a slice header
 	}, true
 }
 
