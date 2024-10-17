@@ -73,8 +73,10 @@ import (
 	"unsafe"
 
 	"github.com/blitz-frost/conv"
-	"github.com/blitz-frost/encoding"
+	encmsg "github.com/blitz-frost/encoding/msg"
 	"github.com/blitz-frost/io"
+	iomsg "github.com/blitz-frost/io/msg"
+	"github.com/blitz-frost/msg"
 )
 
 // to ensure a level of portability, meta values are encoded as uint64
@@ -239,7 +241,8 @@ func (x *Block) metaReserve() int {
 // A Codec is used to create Block values, which will inherit its concrete type mapping when dealing with interfaces.
 // By using different Codecs, a program may define independent contracts with multiple other programs.
 //
-// It implements encoding.Codec, to facilitate usage as part of a larger communication framework.
+// It implements encoding/msg.Codec, to facilitate usage as part of a larger communication framework.
+// Doesn't implement the base encoding.Codec, because the write side wouldn't make sense (encoding can't gradually be written somewhere).
 //
 // A Codec is concurrent safe, but a Block is not.
 type Codec struct {
@@ -271,8 +274,8 @@ func (x Codec) BlockOf(b []byte) *Block {
 	return blockNew(b[:i], b[i:], x.m)
 }
 
-// Decoder reads an entire Block from r and then wraps it as an encoding.Decoder.
-func (x Codec) Decoder(r io.Reader) (encoding.Decoder, error) {
+// BlockFrom reads an entire Block from r.
+func (x Codec) BlockFrom(r io.Reader) (*Block, error) {
 	size := make([]byte, metaSize)
 
 	// read stack size
@@ -299,53 +302,47 @@ func (x Codec) Decoder(r io.Reader) (encoding.Decoder, error) {
 		return nil, err
 	}
 
-	return decoder{
-		r: r,
-		b: blockNew(stack, heap, x.m),
-	}, nil
+	return blockNew(stack, heap, x.m), nil
 }
 
-// Encoder returns an encoding.Encoder that wraps a new Block. It writes out its data when closing.
-func (x Codec) Encoder(w io.Writer) (encoding.Encoder, error) {
-	return encoder{
+// Decoder reads a Block from the Reader and returns an encoding/msg.Reader. Closes the Reader immediately as it will no longer be needed.
+func (x Codec) Decoder(r iomsg.Reader) (encmsg.Reader, error) {
+	b, err := x.BlockFrom(r.Data)
+	if err != nil {
+		return encmsg.Reader{}, nil
+	}
+
+	err = r.Close() // can already close
+	return encmsg.Reader{b, msg.NoopCloser{}}, err
+}
+
+// Encoder returns an encoding/msg.Writer that wraps a new Block. It writes out its data when closing.
+func (x Codec) Encoder(w iomsg.Writer) (encmsg.Writer, error) {
+	b := x.Block()
+
+	e := encodeCloser{
 		w: w,
-		b: x.Block(),
-	}, nil
+		b: b,
+	}
+
+	return encmsg.Writer{b, e}, nil
 }
 
-type decoder struct {
-	r io.Reader
+type encodeCloser struct {
+	w iomsg.Writer
 	b *Block
 }
 
-func (x decoder) Close() error {
-	// could probably close the reader on initialization and do nothing here
-	return x.r.Close()
-}
-
-func (x decoder) Decode(t Type) (Value, error) {
-	return x.b.Decode(t)
-}
-
-type encoder struct {
-	w io.Writer
-	b *Block
-}
-
-func (x encoder) Close() error {
+func (x encodeCloser) Close() error {
 	b := x.b.Bytes()
 	errs := make([]error, 0, 2)
-	if _, err := x.w.Write(b); err != nil {
+	if _, err := x.w.Data.Write(b); err != nil {
 		errs = append(errs, err)
 	}
 	if err := x.w.Close(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
-}
-
-func (x encoder) Encode(v Value) error {
-	return x.b.Encode(v)
 }
 
 func arrayConv(t Type) (converter, bool) {
