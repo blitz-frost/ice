@@ -11,8 +11,8 @@ type T struct {
 	b any
 }
 
-var m, _ = GenerateMapping(T{})
-var c, _ = CodecMake(m)
+var m, _ = GenerateMap(T{})
+var c, _ = MappingMake(m)
 
 // perform an encode + decode loop
 // returns the decoded value, in case the default printed messages aren't adequate, particularly for pointers and channels

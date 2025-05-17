@@ -1,11 +1,12 @@
 package ice
 
 import (
-	"errors"
 	"fmt"
 	. "reflect"
 	"strconv"
 	"sync"
+
+	"github.com/blitz-frost/errors"
 )
 
 // simple in the sense that knowing the kind is enough to identify the base type
@@ -33,8 +34,8 @@ var simpleTypes = map[Kind]Type{
 var baseType = TypeOf(base{})
 
 var (
-	errBaseEmpty      = errors.New("empty base")
-	errBaseIncomplete = errors.New("incomplete base")
+	errBaseEmpty      = errors.Simple("empty base")
+	errBaseIncomplete = errors.Simple("incomplete base")
 )
 
 // base describes a type's structure. Two types with the same base type will map to the same base.
@@ -61,12 +62,12 @@ func mappingNew(m map[Type]byte) (*mapping, error) {
 	// add custom mapping
 	for t, v := range m {
 		if v <= byte(UnsafePointer) {
-			return nil, errors.New("a type may not map to a reserved ID")
+			return nil, errors.Simple("a type may not map to a reserved ID")
 		}
 
 		b := base{v}
 		if _, ok := typeMap[string(b)]; ok {
-			return nil, errors.New("mapping is not unique")
+			return nil, errors.Simple("mapping is not unique")
 		}
 
 		baseMap[t] = b
@@ -161,7 +162,7 @@ func (x *mapping) typeOf(b base) (Type, error) {
 	if n < len(b) {
 		// reject cases where a base contains more than a valid type
 		// this prevents saving the same type under different bases, and would indicate an error has occured somewhere anyway
-		return nil, errors.New("base not of expected size")
+		return nil, errors.Simple("base not of expected size")
 	}
 
 	// save resulting type for later
@@ -308,21 +309,21 @@ func (x *mapping) typeOfEX(b base) (Type, int, error) {
 
 		o = StructOf(fields)
 	default:
-		return nil, 0, errors.New("invalid base")
+		return nil, 0, errors.Simple("invalid base")
 	}
 
 	return o, n, nil
 }
 
-// GenerateMapping takes a list of values, and returns an id mapping for the encountered.
+// GenerateMap takes a list of values, and returns an id mapping for the encountered corresponding types.
 // The mapping is guaranteed to be always be the same for the same input value types.
-func GenerateMapping(v ...any) (map[Type]byte, error) {
+func GenerateMap(v ...any) (map[Type]byte, error) {
 	o := make(map[Type]byte)
 	i := byte(UnsafePointer + 1) // skip reserved ids
 	for _, val := range v {
 		if i == 0 {
 			// reached overflow
-			return nil, errors.New("too many types")
+			return nil, errors.Simple("too many types")
 		}
 		t := TypeOf(val)
 		if _, ok := o[t]; ok {

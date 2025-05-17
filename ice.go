@@ -68,15 +68,11 @@
 package ice
 
 import (
-	"errors"
 	. "reflect"
 	"unsafe"
 
 	"github.com/blitz-frost/conv"
-	encmsg "github.com/blitz-frost/encoding/msg"
 	"github.com/blitz-frost/io"
-	iomsg "github.com/blitz-frost/io/msg"
-	"github.com/blitz-frost/msg"
 )
 
 // to ensure a level of portability, meta values are encoded as uint64
@@ -238,30 +234,27 @@ func (x *Block) metaReserve() int {
 	return i
 }
 
-// A Codec is used to create Block values, which will inherit its concrete type mapping when dealing with interfaces.
-// By using different Codecs, a program may define independent contracts with multiple other programs.
+// A Mapping is used to create Block values, which will inherit its concrete type mapping when dealing with interfaces.
+// By using different Mappings, a program may define multiple independent contracts with other programs.
 //
-// It implements encoding/msg.Codec, to facilitate usage as part of a larger communication framework.
-// Doesn't implement the base encoding.Codec, because the write side wouldn't make sense (encoding can't gradually be written somewhere).
-//
-// A Codec is concurrent safe, but a Block is not.
-type Codec struct {
+// A Mapping is concurrent safe, but a Block is not.
+type Mapping struct {
 	m *mapping
 }
 
-// CodecMake creates a Codec that will use the provided type mapping when dealing with interface values. Unnamed types are valid, making them slightly more efficient as it skips generic type recognition.
+// MappingMake creates a Mapping that will use the provided type mapping when dealing with interface values. Unnamed types are valid, making them slightly more efficient as it skips generic type recognition.
 //
 // Id values 0-26 are reserved. Thus, only up to 229 unique types may be provided. This should be more than enough for any reasonable use case.
-func CodecMake(m map[Type]byte) (Codec, error) {
+func MappingMake(m map[Type]byte) (Mapping, error) {
 	mp, err := mappingNew(m)
 	if err != nil {
-		return Codec{}, err
+		return Mapping{}, err
 	}
-	return Codec{mp}, nil
+	return Mapping{mp}, nil
 }
 
 // Block returns a valid empty Block.
-func (x Codec) Block() *Block {
+func (x Mapping) Block() *Block {
 	// stack and heap start with their own lengths; initially unknown so just allocate the space
 	stack := make([]byte, metaSize)
 	heap := make([]byte, metaSize)
@@ -269,13 +262,13 @@ func (x Codec) Block() *Block {
 }
 
 // BlockOf initializes a Block value on top of what is assumed to be a valid raw binary encoding.
-func (x Codec) BlockOf(b []byte) *Block {
+func (x Mapping) BlockOf(b []byte) *Block {
 	i := metaRead(&b[0])
 	return blockNew(b[:i], b[i:], x.m)
 }
 
 // BlockFrom reads an entire Block from r.
-func (x Codec) BlockFrom(r io.Reader) (*Block, error) {
+func (x Mapping) BlockFrom(r io.Reader) (*Block, error) {
 	size := make([]byte, metaSize)
 
 	// read stack size
@@ -303,46 +296,6 @@ func (x Codec) BlockFrom(r io.Reader) (*Block, error) {
 	}
 
 	return blockNew(stack, heap, x.m), nil
-}
-
-// Decoder reads a Block from the Reader and returns an encoding/msg.Reader. Closes the Reader immediately as it will no longer be needed.
-func (x Codec) Decoder(r iomsg.Reader) (encmsg.Reader, error) {
-	b, err := x.BlockFrom(r.Data)
-	if err != nil {
-		return encmsg.Reader{}, nil
-	}
-
-	err = r.Close() // can already close
-	return encmsg.Reader{b, msg.NoopCloser{}}, err
-}
-
-// Encoder returns an encoding/msg.Writer that wraps a new Block. It writes out its data when closing.
-func (x Codec) Encoder(w iomsg.Writer) (encmsg.Writer, error) {
-	b := x.Block()
-
-	e := encodeCloser{
-		w: w,
-		b: b,
-	}
-
-	return encmsg.Writer{b, e}, nil
-}
-
-type encodeCloser struct {
-	w iomsg.Writer
-	b *Block
-}
-
-func (x encodeCloser) Close() error {
-	b := x.b.Bytes()
-	errs := make([]error, 0, 2)
-	if _, err := x.w.Data.Write(b); err != nil {
-		errs = append(errs, err)
-	}
-	if err := x.w.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
 }
 
 func arrayConv(t Type) (converter, bool) {
@@ -500,11 +453,22 @@ func interfaceInv(t Type) (inverter, bool) {
 	}, true
 }
 
-// A solid type doesn't involve pointers, and is stored in a single memory block whole size is knowable in advance.
+// A solid type doesn't involve pointers, and is stored in a single memory block whose size is knowable in advance.
 func isSolid(t Type) bool {
 	switch t.Kind() {
 	case Chan, Func, Interface, Map, Pointer, Slice, String:
 		return false
+	case Array:
+		return isSolid(t.Elem())
+	case Struct:
+		n := t.NumField()
+		for i := 0; i < n; i++ {
+			field := t.Field(i)
+			if !isSolid(field.Type) {
+				return false
+			}
+		}
+		return true
 	}
 	return true
 }
