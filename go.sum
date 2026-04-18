@@ -4,9 +4,13 @@ github.com/blitz-frost/encoding v0.1.1 h1:CJYMHRbk8N3XGZLV5YC0PGpSmE6209WlHWjit0
 github.com/blitz-frost/encoding v0.1.1/go.mod h1:XHnEacoN993pPb6TCTNNCofVc7gFmG98sk0fcpPlQts=
 github.com/blitz-frost/encoding v0.1.2 h1:3MmkiXa4R8PdqY30TcrP2LYXKOr8xiOsxTAD6++F3I8=
 github.com/blitz-frost/encoding v0.1.2/go.mod h1:THzTreX385xrhKocpJ1gMumSv9IEoOAHyFwkh8hN7pE=
+github.com/blitz-frost/encoding v0.2.0 h1:48aUEEjrCtkVXBAIdDWyb+yqHNJz0DhfuEvR0X/NoCI=
+github.com/blitz-frost/encoding v0.2.0/go.mod h1:Wl5q4NrvG9HwS+Glfv7snHIK2sU6FgEy+cmZByXyFlE=
 github.com/blitz-frost/io v0.2.4 h1:p2yhgdzqQ5BIZ2nI54atmJ4ZDmI9HQYWVqRF/kRS75I=
 github.com/blitz-frost/io v0.2.4/go.mod h1:h7gT4ncQ+eyYZMCnsrKfVlue5gXwZaMQ+DMXS+EaRVs=
 github.com/blitz-frost/io v0.2.6 h1:dyngmDMLBj0bQCZ5mTKrxURBlJH1+aFnd5Kz+uYNLxA=
 github.com/blitz-frost/io v0.2.6/go.mod h1:h7gT4ncQ+eyYZMCnsrKfVlue5gXwZaMQ+DMXS+EaRVs=
 github.com/blitz-frost/io v0.2.7 h1:1/9tjdFCfb6pE2c365x9Y8zPiC4QZoQ2e8NqhYYyqhk=
 github.com/blitz-frost/io v0.2.7/go.mod h1:h7gT4ncQ+eyYZMCnsrKfVlue5gXwZaMQ+DMXS+EaRVs=
+github.com/blitz-frost/io v0.3.0 h1:i+nz9x+Pc7keBFzmutcq15PUVWe+VQ29/0mIXhGC08c=
+github.com/blitz-frost/io v0.3.0/go.mod h1:MNfy11ySZjvENrO8CNtGTwCf3CfcGb97LYd9RhUPY+0=

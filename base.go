@@ -49,7 +49,7 @@ type mapping struct {
 	typeMux sync.RWMutex
 }
 
-func mappingNew(m map[Type]byte) (*mapping, error) {
+func mappingMake(m map[Type]byte) (*mapping, error) {
 	// copy simple unnamed types
 	baseMap := make(map[Type]base)
 	typeMap := make(map[string]Type)

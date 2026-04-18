@@ -23,7 +23,10 @@ func ExchangeInlet(src iomsg.ExchangeInlet, m ice.Mapping) encmsg.ExchangeInlet 
 func ExchangeInput(in iomsg.ExchangeInput, m ice.Mapping) (encmsg.ExchangeInput, error) {
 	b, err := m.BlockFrom(in.Read)
 	if err != nil {
-		oErr := errors.Message("read Block", err)
+		oErr := &errors.T{
+			Message: "read Block",
+			Sub:     err,
+		}
 		oErr.Link(in.Cancel())
 		return encmsg.ExchangeInput{}, oErr
 	}
@@ -97,7 +100,7 @@ func (x *exchangeOutput) Close() error {
 
 	var err error
 	if x.out, err = x.dst(); err != nil {
-		return err
+		return errors.TraceLine(err)
 	}
 
 	return writeAndClose(x.b, iomsg.Output{
@@ -109,6 +112,7 @@ func (x *exchangeOutput) Close() error {
 func (x *exchangeOutput) Input() (encmsg.Input, error) {
 	if !x.closed {
 		if err := x.Close(); err != nil {
+			err = errors.TraceLine(err)
 			return encmsg.Input{}, err
 		}
 	}
@@ -119,17 +123,19 @@ func (x *exchangeOutput) Input() (encmsg.Input, error) {
 func inputMake(src iomsg.Inlet, m ice.Mapping) (encmsg.Input, error) {
 	in, err := src()
 	if err != nil {
+		err = errors.TraceLine(err)
 		return encmsg.Input{}, err
 	}
 
 	b, err := m.BlockFrom(in.Read)
 	if err != nil {
-		oErr := errors.Message("read Block", err)
+		oErr := errors.TraceLine(err)
 		oErr.Link(in.Close())
 		return encmsg.Input{}, oErr
 	}
 
 	if err = in.Close(); err != nil { // no longer needed
+		err = errors.TraceLine(err)
 		return encmsg.Input{}, err
 	}
 
@@ -159,12 +165,17 @@ func outputMake(dst iomsg.Outlet, m ice.Mapping) encmsg.Output {
 func writeAndClose(b *ice.Block, out iomsg.Output) error {
 	bytes := b.Bytes()
 
-	var err errors.Group
+	var errs errors.Group
 
-	_, err1 := out.Write(bytes)
-	err.Add(err1)
+	if errIo := out.Write(bytes); errIo != nil {
+		err := errors.TraceLine(errIo)
+		errs = append(errs, err)
+	}
 
-	err.Add(out.Close())
+	if err := out.Close(); err != nil {
+		err = errors.TraceLine(err)
+		errs = append(errs, err)
+	}
 
-	return err.Wrap()
+	return errs.Resolve()
 }

@@ -246,7 +246,7 @@ type Mapping struct {
 //
 // Id values 0-26 are reserved. Thus, only up to 229 unique types may be provided. This should be more than enough for any reasonable use case.
 func MappingMake(m map[Type]byte) (Mapping, error) {
-	mp, err := mappingNew(m)
+	mp, err := mappingMake(m)
 	if err != nil {
 		return Mapping{}, err
 	}
@@ -272,26 +272,26 @@ func (x Mapping) BlockFrom(r io.Reader) (*Block, error) {
 	size := make([]byte, metaSize)
 
 	// read stack size
-	if _, err := r.Read(size); err != nil {
+	if err := r.Read(size); err != nil {
 		return nil, err
 	}
 
 	// allocate and read stack
 	stack := make([]byte, metaRead(&size[0]))
 	copy(stack, size)
-	if _, err := r.Read(stack[metaSize:]); err != nil {
+	if err := r.Read(stack[metaSize:]); err != nil {
 		return nil, err
 	}
 
 	// read heap size
-	if _, err := r.Read(size); err != nil {
+	if err := r.Read(size); err != nil {
 		return nil, err
 	}
 
 	// allocate and read heap
 	heap := make([]byte, metaRead(&size[0]))
 	copy(heap, size)
-	if _, err := r.Read(heap[metaSize:]); err != nil {
+	if err := r.Read(heap[metaSize:]); err != nil {
 		return nil, err
 	}
 
