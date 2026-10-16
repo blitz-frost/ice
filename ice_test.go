@@ -11,13 +11,25 @@ type T struct {
 	b any
 }
 
-var m, _ = GenerateMap(T{})
-var c, _ = MappingMake(m)
+var reg = RegistryMake()
+
+func init() {
+	RegisterConcrete[T](reg)
+	RegisterConcrete[int](reg)
+
+	RegisterInterfaceConverter[any](reg, func(x *Block, v reflect.Value) error {
+		return x.Freeze("placeholder")
+	})
+	RegisterInterfaceInverter[any](reg, func(x *Block) (reflect.Value, error) {
+		t := reflect.TypeFor[string]()
+		return x.Decode(t)
+	})
+}
 
 // perform an encode + decode loop
 // returns the decoded value, in case the default printed messages aren't adequate, particularly for pointers and channels
 func test(v any) any {
-	block := c.Block()
+	block := reg.Block()
 	t := reflect.TypeOf(v)
 
 	err := block.Freeze(v)
@@ -28,7 +40,7 @@ func test(v any) any {
 	b := block.Bytes()
 	fmt.Println(t, "->", b)
 
-	block = c.BlockOf(b)
+	block = reg.BlockOf(b)
 	oVal, err := block.Decode(t)
 	if err != nil {
 		fmt.Println(t, "thaw error:", err)
@@ -41,7 +53,7 @@ func test(v any) any {
 
 func TestArray(t *testing.T) {
 	test([4]int{1, 2, 3, 4})
-	test([2][]int{[]int{1, 2}, []int{3, 4}})
+	test([2][]int{{1, 2}, {3, 4}})
 }
 
 func TestChan(t *testing.T) {
@@ -58,8 +70,8 @@ func TestInt(t *testing.T) {
 }
 
 func TestInterface(t *testing.T) {
-	b := test(T{1, T{2, 3}}).(T)
-	fmt.Println(reflect.TypeOf(b.b))
+	test(T{1, T{2, 3}})
+	test(T{1, "something"})
 }
 
 func TestMap(t *testing.T) {

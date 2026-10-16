@@ -68,11 +68,11 @@
 package ice
 
 import (
+	"reflect"
 	. "reflect"
 	"unsafe"
 
 	"github.com/blitz-frost/conv"
-	"github.com/blitz-frost/io"
 )
 
 // to ensure a level of portability, meta values are encoded as uint64
@@ -81,18 +81,16 @@ const (
 )
 
 var (
-	libConv    *conv.Library[converter]
-	schemeConv = conv.Scheme[converter]{}
+	libConv    conv.Library[Converter]
+	schemeConv = conv.Scheme[Converter]{}
 
-	libInv    *conv.Library[inverter]
-	schemeInv = conv.Scheme[inverter]{}
+	libInv    conv.Library[Inverter]
+	schemeInv = conv.Scheme[Inverter]{}
 )
 
-var typeBlock = TypeOf(Block{})
-
 type (
-	converter = func(*Block, Value) error
-	inverter  = func(*Block) (Value, error)
+	Converter = func(*Block, Value) error
+	Inverter  = func(*Block) (Value, error)
 )
 
 func init() {
@@ -126,15 +124,15 @@ func init() {
 	schemeConv.Use(interfaceConv)
 	schemeInv.Use(interfaceInv)
 
-	libConv = conv.NewLibrary[converter](schemeConv.Build, nil)
-	libInv = conv.NewLibrary[inverter](schemeInv.Build, nil)
+	libConv = conv.LibraryMake(schemeConv.Build, nil)
+	libInv = conv.LibraryMake(schemeInv.Build, nil)
 }
 
 // A Block is a container for encoded data.
 // Values can be added or retrieved from the Block through the Freeze/Encode and Thaw/Decode methods.
 // A Block can be used either for freezing or thawing, but not both.
 //
-// Block values must be obtain via a valid Codec.
+// Block values must be obtained via a valid Mapping.
 type Block struct {
 	stack []byte // encoded data
 	i     uint64 // working index in stack
@@ -152,18 +150,17 @@ type Block struct {
 
 	isHeap bool // is this a heap block? (see pointer conversion)
 
-	// Registered mappings for interface handling.
-	m *mapping
+	registry Registry
 }
 
-func blockNew(stack, heap []byte, m *mapping) *Block {
-	return &Block{
-		stack:  stack,
-		i:      metaSize, // stack starts with the end index; it's set at the end
-		frozen: make(map[any]uint64),
-		thawed: make(map[uint64]any),
-		heap:   heap,
-		m:      m,
+func blockMake(stack, heap []byte, reg Registry) Block {
+	return Block{
+		stack:    stack,
+		i:        metaSize, // stack starts with the end index; it's set at the end
+		frozen:   make(map[any]uint64),
+		thawed:   make(map[uint64]any),
+		heap:     heap,
+		registry: reg,
 	}
 }
 
@@ -193,7 +190,7 @@ func (x *Block) Freeze(v any) error {
 
 // Thaw is the decoding counterpart to Block.Freeze, but currently methods can't have type parameters.
 func Thaw[T any](x *Block) (T, error) {
-	t := conv.TypeEval[T]()
+	t := reflect.TypeFor[T]()
 	f := libInv.Get(t)
 	v, err := f(x)
 	if err != nil {
@@ -234,71 +231,7 @@ func (x *Block) metaReserve() int {
 	return i
 }
 
-// A Mapping is used to create Block values, which will inherit its concrete type mapping when dealing with interfaces.
-// By using different Mappings, a program may define multiple independent contracts with other programs.
-//
-// A Mapping is concurrent safe, but a Block is not.
-type Mapping struct {
-	m *mapping
-}
-
-// MappingMake creates a Mapping that will use the provided type mapping when dealing with interface values. Unnamed types are valid, making them slightly more efficient as it skips generic type recognition.
-//
-// Id values 0-26 are reserved. Thus, only up to 229 unique types may be provided. This should be more than enough for any reasonable use case.
-func MappingMake(m map[Type]byte) (Mapping, error) {
-	mp, err := mappingMake(m)
-	if err != nil {
-		return Mapping{}, err
-	}
-	return Mapping{mp}, nil
-}
-
-// Block returns a valid empty Block.
-func (x Mapping) Block() *Block {
-	// stack and heap start with their own lengths; initially unknown so just allocate the space
-	stack := make([]byte, metaSize)
-	heap := make([]byte, metaSize)
-	return blockNew(stack, heap, x.m)
-}
-
-// BlockOf initializes a Block value on top of what is assumed to be a valid raw binary encoding.
-func (x Mapping) BlockOf(b []byte) *Block {
-	i := metaRead(&b[0])
-	return blockNew(b[:i], b[i:], x.m)
-}
-
-// BlockFrom reads an entire Block from r.
-func (x Mapping) BlockFrom(r io.Reader) (*Block, error) {
-	size := make([]byte, metaSize)
-
-	// read stack size
-	if err := r.Read(size); err != nil {
-		return nil, err
-	}
-
-	// allocate and read stack
-	stack := make([]byte, metaRead(&size[0]))
-	copy(stack, size)
-	if err := r.Read(stack[metaSize:]); err != nil {
-		return nil, err
-	}
-
-	// read heap size
-	if err := r.Read(size); err != nil {
-		return nil, err
-	}
-
-	// allocate and read heap
-	heap := make([]byte, metaRead(&size[0]))
-	copy(heap, size)
-	if err := r.Read(heap[metaSize:]); err != nil {
-		return nil, err
-	}
-
-	return blockNew(stack, heap, x.m), nil
-}
-
-func arrayConv(t Type) (converter, bool) {
+func arrayConv(t Type) (Converter, bool) {
 	if t.Kind() != Array {
 		return nil, false
 	}
@@ -306,7 +239,7 @@ func arrayConv(t Type) (converter, bool) {
 	return arrayishConv(t), true
 }
 
-func arrayInv(t Type) (inverter, bool) {
+func arrayInv(t Type) (Inverter, bool) {
 	if t.Kind() != Array {
 		return nil, false
 	}
@@ -323,7 +256,7 @@ func arrayInv(t Type) (inverter, bool) {
 }
 
 // Used by arrayConv and sliceConv. Not directly part of the conversion library. Doesn't make any type checks.
-func arrayishConv(t Type) converter {
+func arrayishConv(t Type) Converter {
 	f, _ := schemeConv.Build(t.Elem())
 	return func(x *Block, v Value) error {
 		n := v.Len()
@@ -331,7 +264,7 @@ func arrayishConv(t Type) converter {
 			return nil
 		}
 
-		for i := 0; i < n; i++ {
+		for i := range n {
 			f(x, v.Index(i))
 		}
 
@@ -339,7 +272,7 @@ func arrayishConv(t Type) converter {
 	}
 }
 
-func chanConv(t Type) (converter, bool) {
+func chanConv(t Type) (Converter, bool) {
 	if t.Kind() != Chan {
 		return nil, false
 	}
@@ -367,7 +300,7 @@ func chanConv(t Type) (converter, bool) {
 	}, true
 }
 
-func chanInv(t Type) (inverter, bool) {
+func chanInv(t Type) (Inverter, bool) {
 	if t.Kind() != Chan {
 		return nil, false
 	}
@@ -391,7 +324,7 @@ func chanInv(t Type) (inverter, bool) {
 	}, true
 }
 
-func invalidConv(t Type) (converter, bool) {
+func invalidConv(t Type) (Converter, bool) {
 	if !conv.Check(t, isValid) {
 		return func(x *Block, v Value) error {
 			return conv.ErrInvalid
@@ -400,7 +333,7 @@ func invalidConv(t Type) (converter, bool) {
 	return nil, false
 }
 
-func invalidInv(t Type) (inverter, bool) {
+func invalidInv(t Type) (Inverter, bool) {
 	if !conv.Check(t, isValid) {
 		return func(x *Block) (Value, error) {
 			return Value{}, conv.ErrInvalid
@@ -409,47 +342,64 @@ func invalidInv(t Type) (inverter, bool) {
 	return nil, false
 }
 
-func interfaceConv(t Type) (converter, bool) {
+func interfaceConv(t Type) (Converter, bool) {
 	if t.Kind() != Interface {
 		return nil, false
 	}
 
 	return func(x *Block, v Value) error {
 		if v.IsNil() {
-			// encode nil values as an empty base
-			x.Freeze(base{})
+			// encode nil values as 0
+			x.Freeze(byte(0))
 			return nil
 		}
 
 		v = v.Elem() // v will initially be an interface type, but we actually want the element it contains
 		vType := v.Type()
 
-		// encode type information
-		b := x.m.baseOf(vType)
-		x.Freeze(b)
+		if id, ok := x.registry.conv[vType]; ok {
+			// encode registered types as ID + normal encoding of that type
+			x.Freeze(id)
+			return x.Encode(v)
+		}
 
-		// encode actual value
-		return x.Encode(v)
+		fn, ok := x.registry.interfaceConv[t] // search by interface type
+		if !ok {
+			return conv.ErrInvalid
+		}
+
+		// encode custom conversion as 1 + the conversion
+		x.Freeze(byte(1))
+		return fn(x, v)
 	}, true
 }
 
-func interfaceInv(t Type) (inverter, bool) {
+func interfaceInv(t Type) (Inverter, bool) {
 	if t.Kind() != Interface {
 		return nil, false
 	}
 
 	return func(x *Block) (Value, error) {
-		b, _ := Thaw[base](x)
-
-		vType, err := x.m.typeOf(b)
-		if err != nil {
-			if err == errBaseEmpty {
-				return Zero(t), nil
+		id, _ := Thaw[byte](x)
+		switch id {
+		case 0:
+			// nil interface
+			return Zero(t), nil
+		case 1:
+			// custom interface
+			fn, ok := x.registry.interfaceInv[t]
+			if !ok {
+				return Value{}, conv.ErrInvalid
 			}
-			return Value{}, err
+			return fn(x)
+		default:
+			// registered concrete type
+			vType, ok := x.registry.inv[id]
+			if !ok {
+				return Value{}, conv.ErrInvalid
+			}
+			return x.Decode(vType)
 		}
-
-		return x.Decode(vType)
 	}, true
 }
 
@@ -462,7 +412,7 @@ func isSolid(t Type) bool {
 		return isSolid(t.Elem())
 	case Struct:
 		n := t.NumField()
-		for i := 0; i < n; i++ {
+		for i := range n {
 			field := t.Field(i)
 			if !isSolid(field.Type) {
 				return false
@@ -486,7 +436,7 @@ func isValid(t Type) bool {
 	return true
 }
 
-func mapConv(t Type) (converter, bool) {
+func mapConv(t Type) (Converter, bool) {
 	if t.Kind() != Map {
 		return nil, false
 	}
@@ -507,7 +457,7 @@ func mapConv(t Type) (converter, bool) {
 	}, true
 }
 
-func mapInv(t Type) (inverter, bool) {
+func mapInv(t Type) (Inverter, bool) {
 	if t.Kind() != Map {
 		return nil, false
 	}
@@ -550,7 +500,7 @@ func metaRead(src *byte) uint64 {
 	return *(*uint64)(unsafe.Pointer(src))
 }
 
-func pointerConv(t Type) (converter, bool) {
+func pointerConv(t Type) (Converter, bool) {
 	if t.Kind() != Pointer {
 		return nil, false
 	}
@@ -600,10 +550,10 @@ func pointerConv(t Type) (converter, bool) {
 		// use a "heap block" to use normal code
 		// this will update the table automatically; we also recover its "stack"
 		tmp := Block{
-			stack:  *heap,
-			frozen: x.frozen,
-			isHeap: true,
-			m:      x.m,
+			stack:    *heap,
+			frozen:   x.frozen,
+			isHeap:   true,
+			registry: x.registry,
 		}
 
 		f(&tmp, v.Elem())
@@ -613,7 +563,7 @@ func pointerConv(t Type) (converter, bool) {
 	}, true
 }
 
-func pointerInv(t Type) (inverter, bool) {
+func pointerInv(t Type) (Inverter, bool) {
 	if t.Kind() != Pointer {
 		return nil, false
 	}
@@ -636,12 +586,12 @@ func pointerInv(t Type) (inverter, bool) {
 
 		// decode the pointer's value from heap
 		tmp := Block{
-			stack:  x.heap,
-			heap:   x.heap,
-			thawed: x.thawed,
-			i:      i,
-			isHeap: true,
-			m:      x.m,
+			stack:    x.heap,
+			heap:     x.heap,
+			thawed:   x.thawed,
+			i:        i,
+			isHeap:   true,
+			registry: x.registry,
 		}
 
 		ov, _ := f(&tmp)
@@ -656,7 +606,7 @@ func pointerInv(t Type) (inverter, bool) {
 	}, true
 }
 
-func sliceConv(t Type) (converter, bool) {
+func sliceConv(t Type) (Converter, bool) {
 	if t.Kind() != Slice {
 		return nil, false
 	}
@@ -685,7 +635,7 @@ func sliceConv(t Type) (converter, bool) {
 	}, true
 }
 
-func sliceInv(t Type) (inverter, bool) {
+func sliceInv(t Type) (Inverter, bool) {
 	if t.Kind() != Slice {
 		return nil, false
 	}
@@ -720,7 +670,7 @@ func sliceInv(t Type) (inverter, bool) {
 	}, true
 }
 
-func solidConv(t Type) (converter, bool) {
+func solidConv(t Type) (Converter, bool) {
 	if !conv.Check(t, isSolid) {
 		return nil, false
 	}
@@ -738,7 +688,7 @@ func solidConv(t Type) (converter, bool) {
 	}, true
 }
 
-func solidInv(t Type) (inverter, bool) {
+func solidInv(t Type) (Inverter, bool) {
 	if !conv.Check(t, isSolid) {
 		return nil, false
 	}
@@ -751,7 +701,7 @@ func solidInv(t Type) (inverter, bool) {
 	}, true
 }
 
-func stringConv(t Type) (converter, bool) {
+func stringConv(t Type) (Converter, bool) {
 	if t.Kind() != String {
 		return nil, false
 	}
@@ -775,7 +725,7 @@ func stringConv(t Type) (converter, bool) {
 	}, true
 }
 
-func stringInv(t Type) (inverter, bool) {
+func stringInv(t Type) (Inverter, bool) {
 	if t.Kind() != String {
 		return nil, false
 	}
@@ -790,13 +740,13 @@ func stringInv(t Type) (inverter, bool) {
 	}, true
 }
 
-func structConv(t Type) (converter, bool) {
+func structConv(t Type) (Converter, bool) {
 	if t.Kind() != Struct {
 		return nil, false
 	}
 
 	type fieldConv struct {
-		fn         converter
+		fn         Converter
 		t          Type
 		isExported bool
 		offset     uintptr
@@ -821,7 +771,9 @@ func structConv(t Type) (converter, bool) {
 	if !haveUnexported {
 		return func(x *Block, v Value) error {
 			for i := range f {
-				f[i].fn(x, v.Field(i))
+				if err := f[i].fn(x, v.Field(i)); err != nil {
+					return err
+				}
 			}
 			return nil
 		}, true
@@ -840,25 +792,29 @@ func structConv(t Type) (converter, bool) {
 
 		for i, field := range f {
 			if field.isExported {
-				field.fn(x, v.Field(i))
+				if err := field.fn(x, v.Field(i)); err != nil {
+					return err
+				}
 				continue
 			}
 
 			pf := unsafe.Add(p, field.offset)
 			vf := NewAt(field.t, pf).Elem()
-			field.fn(x, vf)
+			if err := field.fn(x, vf); err != nil {
+				return err
+			}
 		}
 		return nil
 	}, true
 }
 
-func structInv(t Type) (inverter, bool) {
+func structInv(t Type) (Inverter, bool) {
 	if t.Kind() != Struct {
 		return nil, false
 	}
 
 	type fieldInv struct {
-		fn         inverter
+		fn         Inverter
 		t          Type
 		isExported bool
 		offset     uintptr
