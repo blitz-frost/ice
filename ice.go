@@ -52,13 +52,16 @@
 // This pointer value might end up itself on the heap, if the pointer is reached by dereferencing another pointer. When encoding or decoding, encountered pointers are remembered and reused if encountered again.
 // This also guards against infinite loops in cyclical data.
 //
-// Interfaces are encoded as
+// Interfaces are generally encoded as
 //
 //	[type description][type specific encoding]
 //
-// where "type" is the concrete type of the value being handled. When a Codec has been created with a type-id mapping, Blocks created with that Codec will inherit it.
-// When encountering a mapped type under an interface value, a type id is used to represent it. Otherwise a type representation is used, allowing a decoder to recreate the equivalent unnamed type.
-// No interface implementation checks are made.
+// where "type" is the concrete type of the value being handled.
+// Concrete types may be registered with a [Registry], in order to allow their encoding when they are the underlying type of an interface value.
+// The "any" interface is handled by default, and is capable of dealing with any registered concrete type, as well as any valid non-defined type (such as []int).
+// Custom encodings may be registered for specific interfaces. Note that this relies on exact type matching. For example: if a struct contains an "error" interface field, the custom encoding for that interface is used; if the struct field is of type "any" instead, it will be handled as an "any", even if the underlying concrete type happens to implement the "error" interface.
+// Nil interface values are always handled.
+// A Block inherits the interface handling capabilities of the Registry that created it.
 //
 // Function types and unsafe.Pointers are invalid.
 //
@@ -66,6 +69,8 @@
 //
 // A Block may hold any number of sequentially encoded values, and must never be used for both encoding and decoding. This restriction may be lifted in the future.
 package ice
+
+//TODO update interface encoding comment
 
 import (
 	"reflect"
@@ -357,7 +362,7 @@ func interfaceConv(t Type) (Converter, bool) {
 		v = v.Elem() // v will initially be an interface type, but we actually want the element it contains
 		vType := v.Type()
 
-		if id, ok := x.registry.conv[vType]; ok {
+		if id, ok := x.registry.conv[vType]; ok { // note that vType can't be an interface type
 			// encode registered types as ID + normal encoding of that type
 			x.Freeze(id)
 			return x.Encode(v)
@@ -368,8 +373,8 @@ func interfaceConv(t Type) (Converter, bool) {
 			return conv.ErrInvalid
 		}
 
-		// encode custom conversion as 1 + the conversion
-		x.Freeze(byte(1))
+		// encode custom conversion as Interface (20) + the conversion
+		x.Freeze(customInterface)
 		return fn(x, v)
 	}, true
 }
@@ -385,20 +390,33 @@ func interfaceInv(t Type) (Inverter, bool) {
 		case 0:
 			// nil interface
 			return Zero(t), nil
-		case 1:
+		case customInterface:
 			// custom interface
 			fn, ok := x.registry.interfaceInv[t]
 			if !ok {
 				return Value{}, conv.ErrInvalid
 			}
-			return fn(x)
+
+			v, err := fn(x) // this should return a concrete type
+			if err != nil {
+				return Value{}, err
+			}
+
+			// the caller will expect an interface value (for example to check for nil)
+			return v.Convert(t), nil
 		default:
 			// registered concrete type
 			vType, ok := x.registry.inv[id]
 			if !ok {
 				return Value{}, conv.ErrInvalid
 			}
-			return x.Decode(vType)
+
+			v, err := x.Decode(vType)
+			if err != nil {
+				return Value{}, err
+			}
+
+			return v.Convert(t), nil
 		}
 	}, true
 }

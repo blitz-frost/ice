@@ -2,14 +2,18 @@ package ice
 
 import (
 	. "reflect"
+	"sync"
 
 	"github.com/blitz-frost/errors"
 	"github.com/blitz-frost/io"
 )
 
-// Type registration is not concurrent safe with Block generation or active Block usage.
+// Used to uniquely mark custom interface conversions.
+const customInterface byte = 25
+
+// Type registration must be completed before Block generation.
 type Registry struct {
-	conv map[Type]byte // maps concrete types to unique ids; 0 and 1 are excluded
+	conv map[Type]byte // maps types to unique ids
 	inv  map[byte]Type // inverse of conv
 
 	interfaceConv map[Type]Converter // maps interface types to custom converters
@@ -17,12 +21,239 @@ type Registry struct {
 }
 
 func RegistryMake() Registry {
-	return Registry{
-		conv:          make(map[Type]byte),
-		inv:           make(map[byte]Type),
+	// these are mostly the same values as the reflect.Kind constants
+	conv := map[Type]byte{
+		// Invalid is used to mark nil interfaces
+		TypeFor[bool]():       1,
+		TypeFor[int]():        2,
+		TypeFor[int8]():       3,
+		TypeFor[int16]():      4,
+		TypeFor[int32]():      5,
+		TypeFor[int64]():      6,
+		TypeFor[uint]():       7,
+		TypeFor[uint8]():      8,
+		TypeFor[uint16]():     9,
+		TypeFor[uint32]():     10,
+		TypeFor[uint64]():     11,
+		TypeFor[uintptr]():    12,
+		TypeFor[float32]():    13,
+		TypeFor[float64]():    14,
+		TypeFor[complex64]():  15,
+		TypeFor[complex128](): 16,
+		TypeFor[any]():        20, // Interface value
+		TypeFor[string]():     24,
+		// 25 is used to mark custom interface conversions
+	}
+
+	inv := make(map[byte]Type)
+	for t, b := range conv {
+		inv[b] = t
+	}
+
+	x := Registry{
+		conv:          conv,
+		inv:           inv,
 		interfaceConv: make(map[Type]Converter),
 		interfaceInv:  make(map[Type]Inverter),
 	}
+
+	// caches used when dealing with "any"
+	var (
+		anyConv    = make(map[Type]string)
+		anyConvMux sync.RWMutex
+	)
+
+	anyConverter := func(blk *Block, v Value) error {
+		// to get here, this must have been a non-registered type
+
+		convert := func(s string) error {
+			if err := blk.Freeze(s); err != nil {
+				return err
+			}
+			return blk.Encode(v)
+		}
+
+		// check cache
+
+		t := v.Type()
+
+		anyConvMux.RLock()
+		s, ok := anyConv[t]
+		anyConvMux.RUnlock()
+
+		if ok {
+			return convert(s)
+		}
+
+		// build and cache type representation
+
+		b := make([]byte, 0, 8)
+
+		var walk func(Type) error
+
+		eval := func(t Type) error {
+			if t.Name() != "" {
+				// non-registered defined types can't be decoded
+				return errors.Simple("type is defined")
+			}
+
+			k := t.Kind()
+			b = append(b, byte(k))
+
+			switch k {
+			case Array:
+				b = metaAppend(b, uint64(t.Len()))
+				fallthrough
+			case Pointer, Slice:
+				elem := t.Elem()
+				return walk(elem)
+			case Chan:
+				b = append(b, byte(t.ChanDir()))
+				elem := t.Elem()
+				return walk(elem)
+			case Map:
+				key := t.Key()
+				if err := walk(key); err != nil {
+					return err
+				}
+
+				elem := t.Elem()
+				return walk(elem)
+			}
+
+			return errors.Simple("invalid type")
+		}
+
+		walk = func(t Type) error {
+			// subtypes might be registered
+			id, ok := x.conv[t]
+			if ok {
+				b = append(b, id)
+				return nil
+			}
+
+			return eval(t)
+		}
+
+		if err := eval(t); err != nil {
+			return err
+		}
+
+		s = string(b)
+
+		anyConvMux.Lock()
+		anyConv[t] = s
+		anyConvMux.Unlock()
+
+		return convert(s)
+	}
+
+	var (
+		anyInv    = make(map[string]Type)
+		anyInvMux sync.RWMutex
+	)
+
+	anyInverter := func(blk *Block) (Value, error) {
+		s, err := Thaw[string](blk)
+		if err != nil {
+			return Value{}, err
+		}
+
+		// check cache
+
+		anyInvMux.RLock()
+		t, ok := anyInv[s]
+		anyInvMux.RUnlock()
+
+		if ok {
+			return blk.Decode(t)
+		}
+
+		// parse type and cache it
+
+		// keep original for caching
+		ss := s
+
+		var parse func() (Type, error)
+		parse = func() (Type, error) {
+			b := ss[0]
+			ss = ss[1:]
+
+			t, ok := x.inv[b]
+			if ok {
+				return t, nil
+			}
+
+			switch Kind(b) {
+			case Array:
+				bb := []byte(ss[:metaSize])
+				l := metaRead(&bb[0])
+
+				ss = ss[metaSize:]
+				elem, err := parse()
+				if err != nil {
+					return nil, err
+				}
+
+				return ArrayOf(int(l), elem), nil
+			case Chan:
+				dir := ChanDir(ss[0])
+				ss = ss[1:]
+
+				elem, err := parse()
+				if err != nil {
+					return nil, err
+				}
+
+				return ChanOf(dir, elem), nil
+			case Map:
+				key, err := parse()
+				if err != nil {
+					return nil, err
+				}
+
+				elem, err := parse()
+				if err != nil {
+					return nil, err
+				}
+
+				return MapOf(key, elem), nil
+			case Pointer:
+				elem, err := parse()
+				if err != nil {
+					return nil, err
+				}
+
+				return PointerTo(elem), nil
+			case Slice:
+				elem, err := parse()
+				if err != nil {
+					return nil, err
+				}
+
+				return SliceOf(elem), nil
+			}
+
+			return nil, errors.Simple("unknown type representation")
+		}
+
+		t, err = parse()
+		if err != nil {
+			return Value{}, err
+		}
+
+		anyInvMux.Lock()
+		anyInv[ss] = t
+		anyInvMux.Unlock()
+
+		return blk.Decode(t)
+	}
+
+	t := TypeFor[any]()
+	x.interfaceConv[t] = anyConverter
+	x.interfaceInv[t] = anyInverter
+
+	return x
 }
 
 // Block returns a valid empty Block.
@@ -70,7 +301,7 @@ func (x Registry) BlockFrom(r io.Reader) (Block, error) {
 	return blockMake(stack, heap, x), nil
 }
 
-// Concrete registers a non-interface type. At must 254 types can be registered.
+// Concrete registers a non-interface type. At must 230 types can be registered, including interfaces.
 // Repeated types are ignored.
 //
 // Not concurrent safe with itself or other methods.
@@ -79,17 +310,49 @@ func (x Registry) Concrete(t Type) error {
 		return errors.Simple("type is not concrete")
 	}
 
-	n := len(x.conv)
-	if n == 254 { // max byte variants - 2, since 0 and 1 are reserved
-		return errors.Simple("overflow")
+	return x._register(t)
+}
+
+// Interface registers a custom interface type conversion, which will be used if the concrete type of a value has not been registered.
+// The Converter will receive a value of concrete type, not the interface being registered.
+// The Inverter should return a value of concrete type.
+// Note that different interface types are not equal, even if they are equivalent.
+//
+// t may not be the built-in "any". Repeated calls for the same type will replace the old one.
+//
+// Not concurrent safe with itself or other methods.
+func (x Registry) Interface(t Type, conv Converter, inv Inverter) error {
+	if t.Kind() != Interface {
+		return errors.Simple("type is not an interface")
+	}
+	if t == TypeFor[any]() {
+		return errors.Simple("may not register built-in any")
 	}
 
-	id := byte(n + 2) // ids start at 2
+	if err := x._register(t); err != nil {
+		return err
+	}
 
+	x.interfaceConv[t] = conv
+	x.interfaceInv[t] = inv
+
+	return nil
+}
+
+func (x Registry) _register(t Type) error {
 	if _, ok := x.conv[t]; ok {
 		// ignore duplicates
 		return nil
 	}
+
+	const reserved = 8 // gaps in the map
+
+	n := len(x.conv)
+	if n == 256-reserved {
+		return errors.Simple("overflow")
+	}
+
+	id := byte(n + reserved)
 
 	x.conv[t] = id
 	x.inv[id] = t
@@ -97,41 +360,12 @@ func (x Registry) Concrete(t Type) error {
 	return nil
 }
 
-// InterfaceConverter registers a custom interface type conversion, which will be used if the concrete type of a value has not been registered.
-// The Converter will receive a value of concrete type, not the interface being registered.
-// Note that different interface types are not equal, even if they are equivalent.
-//
-// Not concurrent safe with itself or other methods.
-//
-// Panics if t is not an interface type.
-func (x Registry) InterfaceConverter(t Type, fn Converter) {
-	if t.Kind() != Interface {
-		panic("type is not an interface")
-	}
-	x.interfaceConv[t] = fn
-}
-
-// See [Registry.InterfaceConverter].
-//
-// The Inverter should return a value of concrete type.
-func (x Registry) InterfaceInverter(t Type, fn Inverter) {
-	if t.Kind() != Interface {
-		panic("type is not an interface")
-	}
-	x.interfaceInv[t] = fn
-}
-
 func RegisterConcrete[T any](x Registry) error {
 	t := TypeFor[T]()
 	return x.Concrete(t)
 }
 
-func RegisterInterfaceConverter[T any](x Registry, fn Converter) {
+func RegisterInterface[T any](x Registry, conv Converter, inv Inverter) error {
 	t := TypeFor[T]()
-	x.InterfaceConverter(t, fn)
-}
-
-func RegisterInterfaceInverter[T any](x Registry, fn Inverter) {
-	t := TypeFor[T]()
-	x.InterfaceInverter(t, fn)
+	return x.Interface(t, conv, inv)
 }
